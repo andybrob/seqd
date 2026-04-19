@@ -388,10 +388,11 @@ def _merge_overlapping(
             current["ramp_end"] = max(current["ramp_end"], ev["ramp_end"])
             current["ramp_start"] = min(current["ramp_start"], ev["ramp_start"])
             current["merged_from"].append(ev)
-            # Recompute magnitude as mean over merged window
-            # Effect series: sum both
-            current["effect_series"] = (
-                current["effect_series"].reindex(idx, fill_value=0.0)
+            # Accumulate sum into a running total stored temporarily; we'll divide
+            # by n_members at the end to get the mean (canonical) effect.
+            current["_effect_sum"] = (
+                current.get("_effect_sum",
+                            current["effect_series"].reindex(idx, fill_value=0.0))
                 + ev["effect_series"].reindex(idx, fill_value=0.0)
             )
         else:
@@ -401,10 +402,17 @@ def _merge_overlapping(
 
     merged.append(current)
 
-    # For merged blocks with multiple events, recompute magnitude
+    # For merged blocks with multiple events, finalise effect_series as the MEAN
+    # of the constituent individual effects (not the sum), then recompute magnitude.
+    # Using the mean means block["effect_series"] is the canonical per-block effect,
+    # and only the PRIMARY member will carry it — no division needed downstream.
     for block in merged:
         if len(block["merged_from"]) > 1:
-            # Recompute magnitude as mean over merged window from combined effect
+            n_members = len(block["merged_from"])
+            # "_effect_sum" was accumulated in the merge loop above
+            effect_sum = block.pop("_effect_sum")
+            block["effect_series"] = effect_sum / n_members
+            # Recompute magnitude as mean over merged window from the canonical effect
             rs = block["ramp_start"]
             re = block["ramp_end"]
             mask = (idx_dates >= rs) & (idx_dates <= re)
@@ -462,18 +470,18 @@ def _build_holiday_effects(
             slope = 0.0
         name_drift[name] = slope
 
-    # Pre-divide compound block effect_series by the number of members so that
-    # summing all HolidayEffect.effect_series in holiday_component() sums to
-    # exactly the block's total effect — no double-counting.
-    block_shared_effect: Dict[int, pd.Series] = {}
+    # For each compound block, designate the PRIMARY member (earliest holiday date)
+    # as the sole carrier of the canonical block effect_series.  All other members
+    # receive a zero effect_series.  This ensures holiday_component() sums to
+    # exactly one copy of the canonical effect per block — no double-counting.
+    #
+    # block["effect_series"] is now the MEAN of constituent effects (set in
+    # _merge_overlapping), so it is already the canonical per-block estimate.
+    block_primary_date: Dict[int, datetime.date] = {}
     for block in merged_effects:
-        n_members = len(block["merged_from"])
-        if n_members > 1:
-            # block["effect_series"] is the sum of all constituent effects over
-            # the merged window.  Divide once here and reuse for every member.
-            block_shared_effect[id(block)] = (
-                block["effect_series"].reindex(idx, fill_value=0.0) / n_members
-            )
+        if len(block["merged_from"]) > 1:
+            earliest = min(src["date"] for src in block["merged_from"])
+            block_primary_date[id(block)] = earliest
 
     # Build one HolidayEffect per occurrence
     for name, occ_list in occurrence_data.items():
@@ -511,12 +519,19 @@ def _build_holiday_effects(
                 re = occ["ramp_end"]
                 mag = occ["magnitude"]
 
-            # effect_series for compound blocks: each member carries
-            # block_effect / n_members so that summing all members yields the
-            # block total exactly (no double-counting).
-            # For non-compound occurrences, use the individual occurrence effect.
+            # effect_series assignment:
+            # - Non-compound occurrence: use the individual occurrence effect.
+            # - Compound block PRIMARY member (earliest date): carry the
+            #   canonical block effect_series (mean of all constituent effects).
+            # - Compound block NON-PRIMARY member: zero series — so that
+            #   holiday_component() sums exactly ONE copy of the canonical
+            #   effect per compound block with no double-counting.
             if is_compound and block is not None:
-                effect_series = block_shared_effect[id(block)]
+                primary_date = block_primary_date[id(block)]
+                if h_date == primary_date:
+                    effect_series = block["effect_series"].reindex(idx, fill_value=0.0)
+                else:
+                    effect_series = pd.Series(0.0, index=idx)
             else:
                 effect_series = occ["effect_series"].reindex(idx, fill_value=0.0)
 
