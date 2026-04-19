@@ -280,7 +280,10 @@ def _detect_ramp_end(
     """Forward scan from h+1 to find baseline return."""
     threshold_return = 1.5 * sigma_ref
     consecutive = 0
-    ramp_end = h_date + datetime.timedelta(days=7)  # default
+    # Default: full search window (not a hardcoded 7-day fallback).
+    # If no recovery is detected within holiday_window days the effect is
+    # considered to persist through the entire search span.
+    ramp_end = h_date + datetime.timedelta(days=holiday_window)
 
     for delta in range(1, holiday_window + 1):
         t = h_date + datetime.timedelta(days=delta)

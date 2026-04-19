@@ -138,9 +138,11 @@ SeqdDecomposer(
 
 **Multiplicative vs additive**: Auto-detected by comparing `std(detrended) / mean(y)` to 0.15. Can be forced.
 
-**Holiday ramp detection**: Uses backward CUSUM to find when the effect begins (up to 14 days before holiday) and a forward baseline-return scan to find when it ends (returns within 1.5σ for 2 consecutive days).
+**Holiday ramp detection**: Uses backward CUSUM to find when the effect begins (up to `holiday_window` days before the holiday) and a forward baseline-return scan to find when it ends (returns within 1.5σ for 2 consecutive days). If no recovery is detected within `holiday_window` days after the holiday, the ramp is considered to persist through the full search window.
 
-**Annual seasonality**: Fourier regression with BIC selection over K ∈ {1, 2, 3, 4}. BIC is computed manually (no statsmodels dependency).
+**Annual seasonality**: Fourier regression with BIC selection over K ∈ {0, 1, 2, 3, 4}. K=0 (no annual component) is the baseline model, so a series with no meaningful annual seasonality will not have a spurious harmonic extracted. BIC is computed manually (no statsmodels dependency).
+
+**`weekly_component()` in multiplicative mode**: Returns `original * (1 - 1/coeff)` — the absolute amount removed at each date. This scales with the level of the series. For a level-independent view of the weekly pattern, use `weekly.coefficients` directly (the 7-element array of multiplicative factors).
 
 **Drift detection**: Weekly DOW coefficients are re-estimated on trailing windows ([60, 90, 365] days, stepped every 7 days). The OLS slope over time classifies each DOW as "stable" or "drifting" (`|slope| > 1% of full-sample coefficient`).
 

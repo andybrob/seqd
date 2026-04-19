@@ -121,17 +121,29 @@ class DecompositionResult:
     r2_by_component: Dict[str, float]
 
     def weekly_component(self) -> pd.Series:
-        """Return the full weekly effect series aligned to original index."""
+        """Return the full weekly effect series aligned to original index.
+
+        In **additive** mode this is simply the DOW coefficient for each
+        date (a level-independent series of 7 repeating values).
+
+        In **multiplicative** mode the returned series is
+        ``original * (1 - 1/coeff)``, i.e. the absolute amount that was
+        removed from each observation.  The amplitude therefore scales with
+        the local level of the series, which means the series is NOT
+        suitable for direct comparison across periods with very different
+        levels.  Use ``weekly.coefficients`` (the 7-element array of pure
+        multiplicative factors) for a level-independent representation.
+
+        In both modes the identity ``fitted() == series`` holds exactly
+        because ``residual + weekly_component() + holiday_component() +
+        annual_component() == series``.
+        """
         idx = self.series.index
         dow = idx.dayofweek  # Monday=0
         if self.weekly.is_multiplicative:
-            # Return multiplicative deviation from 1 as an additive-equivalent
-            # For reconstruction: y_reconstructed = residual * weekly_coeff
-            coeff = self.weekly.coefficients[dow]
-            # We return the additive adjustment: series * (coeff - 1) / coeff or
-            # just the component that was removed
-            # In multiplicative: y_w = y / coeff => removed = y - y/coeff = y*(1 - 1/coeff)
-            # But we store the effect as the amount removed from y
+            # In multiplicative mode: y_w = y / coeff
+            # => removed = y - y/coeff = y * (1 - 1/coeff)
+            # This additive representation ensures exact reconstruction.
             return pd.Series(
                 self.series.values * (1.0 - 1.0 / self.weekly.coefficients[dow]),
                 index=idx,
