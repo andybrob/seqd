@@ -255,9 +255,11 @@ CUSUM is sensitive to concentrated, high-amplitude ramps.  The run criterion is 
 
 Scan forward from $h + 1$, tracking consecutive days where $|r(t)| < 1.5\,\hat{\sigma}_{ref}$:
 
-$$\hat{t}_{end} = \min\!\left\{t > h : |r(t)| < 1.5\,\hat{\sigma}_{ref} \;\text{ and }\; |r(t+1)| < 1.5\,\hat{\sigma}_{ref}\right\} - 1\text{ day}$$
+Before checking the threshold criterion, the residuals are smoothed with a 3-point median filter: $\tilde{r}(t) = \operatorname{Median}(r(t-1), r(t), r(t+1))$ (boundary values default to 0).  The smoothing suppresses false early exits caused by isolated noisy days within an otherwise active ramp.
 
-That is, the ramp end is set to the first day of the first pair of consecutive below-threshold days, minus one, so that the window closes on the last day the series is still elevated.  If no such pair exists within $W$ days after $h$, the fallback is:
+$$\hat{t}_{end} = \min\!\left\{t > h : |\tilde{r}(t)| < 1.5\,\hat{\sigma}_{ref} \;\text{ and }\; |\tilde{r}(t+1)| < 1.5\,\hat{\sigma}_{ref}\right\} - 1\text{ day}$$
+
+That is, the ramp end is set to the first day of the first pair of consecutive below-threshold smoothed residual days, minus one, so that the window closes on the last day the series is still elevated.  If no such pair exists within $W$ days after $h$, the fallback is:
 
 $$\hat{t}_{end} = h + W$$
 
@@ -313,11 +315,11 @@ This allows comparing the peak contributions of constituent holidays within a co
 
 ### 6.1 Fourier Basis
 
-Let $t_i = i \in \{0, 1, \ldots, n-1\}$ denote integer days since the first observation.  For $K$ harmonics, the Fourier design matrix is:
+Let $t_i$ denote the integer number of days from January 1 of the first calendar year in the series to observation $i$.  Specifically, if the series starts on date $d_0$, then $t_i = (d_i - \text{Jan 1 of } d_0\text{'s year})$ in days.  This calendar-anchored time index ensures that Fourier phases are aligned to the calendar year rather than the arbitrary start date of the series, so that the estimated $\hat{a}_k$ and $\hat{b}_k$ coefficients carry consistent seasonal-phase interpretations across datasets with different start dates.  For $K$ harmonics, the Fourier design matrix is:
 
 $$\mathbf{X}(t, K) = \left[1,\; \cos\frac{2\pi t}{P},\; \sin\frac{2\pi t}{P},\; \cos\frac{4\pi t}{P},\; \sin\frac{4\pi t}{P},\; \ldots,\; \cos\frac{2K\pi t}{P},\; \sin\frac{2K\pi t}{P}\right]$$
 
-where $P = 365.25$ days.  This gives an $n \times (2K+1)$ design matrix including an intercept column.  The time index $t$ is measured from the first observation, not from January 1; see Known Limitations.
+where $P = 365.25$ days.  This gives an $n \times (2K+1)$ design matrix including an intercept column.
 
 ### 6.2 Harmonic Selection via BIC
 
@@ -327,11 +329,11 @@ $$\tilde{y}_t^{(h)} = y_t^{(h)} - \hat{\alpha}_{dt} - \hat{\beta}_{dt}\,t$$
 
 where $[\hat{\alpha}_{dt}, \hat{\beta}_{dt}]$ are OLS estimates from regressing $y_t^{(h)}$ on $[1, t]$.  This detrended series is used **only for BIC selection**; the final component fit in Section 6.3 uses the original $y_t^{(h)}$.
 
-BIC is evaluated over $K \in \{0, 1, 2, 3, 4\}$:
+BIC is evaluated over $K \in \{0, 1, 2, 3, 4, 5, 6\}$:
 
 $$\operatorname{BIC}(K) = n \log\!\left(\frac{\operatorname{RSS}(K)}{n}\right) + (2K+1)\log(n)$$
 
-where $\operatorname{RSS}(K) = \sum_{t=0}^{n-1}\!\left(\tilde{y}_t^{(h)} - \hat{\tilde{y}}_t^{(K)}\right)^2$ is the residual sum of squares from fitting $\mathbf{X}(t, K)$ on the detrended series, and $K = 0$ (intercept only, one parameter) is the no-seasonality baseline.  The selected order is $\hat{K} = \arg\min_K \operatorname{BIC}(K)$.
+where $\operatorname{RSS}(K) = \sum_{t=0}^{n-1}\!\left(\tilde{y}_t^{(h)} - \hat{\tilde{y}}_t^{(K)}\right)^2$ is the residual sum of squares from fitting $\mathbf{X}(t, K)$ on the detrended series, and $K = 0$ (intercept only, one parameter) is the no-seasonality baseline.  The selected order is $\hat{K} = \arg\min_K \operatorname{BIC}(K)$.  Any $K$ whose fitted values are non-finite is skipped.
 
 ### 6.3 Final Estimation
 
@@ -408,6 +410,7 @@ SeqdDecomposer(
     holiday_dates,
     multiplicative=None,
     holiday_window=14,
+    max_holiday_window=None,
     reference_window=60,
 )
 ```
@@ -419,6 +422,7 @@ SeqdDecomposer(
 | `holiday_dates` | `list` or `dict` | required | Holiday dates. Flat list (`["2023-12-25", ...]`) or named dict (`{"Christmas": [...], ...}`). Elements may be `str`, `datetime.date`, or `pd.Timestamp`. A flat list groups dates by calendar (month, day): all years with the same month-day are treated as the same holiday. |
 | `multiplicative` | `bool` or `None` | `None` | Force `True` (multiplicative) or `False` (additive). `None` = auto-detect per Section 3.3. |
 | `holiday_window` | `int` | `14` | Half-width $W$ of the holiday search window in days. Controls how far before and after the holiday date the ramp detection and ramp-end scan extend. Recommendation: use 35 or more for extended retail events such as Black Friday / Cyber Monday. |
+| `max_holiday_window` | `int` or `None` | `None` | When set, overrides `holiday_window` as the effective search window passed to the holiday stage. Useful when `holiday_window` is set to a conservative default but a specific run requires a wider window without changing the base parameter. When `None`, `holiday_window` is used as-is. |
 | `reference_window` | `int` | `60` | Length $R$ of the pre/post-holiday baseline window in days. A warning is issued when `len(y) < 2 * reference_window`. |
 
 **`fit(y)`**
@@ -473,7 +477,9 @@ Returns `DecompositionResult`.  Raises `ValueError` on constraint violations; is
 | `magnitude_drift` | `float` | OLS slope of `year_magnitudes` over year index $y = 0, \ldots, Y-1$. Zero if $Y < 2$. |
 | `compound` | `bool` | `True` if this occurrence was merged into a compound block. |
 | `compound_block_id` | `str` or `None` | Shared identifier for all members of the same compound block (e.g. `"compound_block_2023_1"`). `None` for non-compound occurrences. |
-| `individual_peak_magnitude` | `float` or `None` | Mean of the pre-merge occurrence effect over $[h-3, h+3]$. Unreliable near series boundaries; see Known Limitations. |
+| `individual_peak_magnitude` | `float` or `None` | Mean of the pre-merge occurrence effect over $[h-3, h+3]$. Unreliable near series boundaries; see `individual_peak_magnitude_reliable`. |
+| `ramp_start_ceiling_hit` | `bool` | `True` if the detected ramp start reached or exceeded the search boundary $h - W$ (i.e. the true ramp may begin earlier than detected). |
+| `individual_peak_magnitude_reliable` | `bool` | `False` if the $\pm 3$-day window extends outside the series bounds, or if the occurrence's `ramp_end` is at or beyond the last date in the series (meaning no post-holiday reference exists to anchor the baseline). |
 
 ---
 
@@ -481,7 +487,7 @@ Returns `DecompositionResult`.  Raises `ValueError` on constraint violations; is
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `n_harmonics` | `int` | BIC-selected harmonic count $\hat{K} \in \{0,1,2,3,4\}$. Zero means no annual seasonality was detected. |
+| `n_harmonics` | `int` | BIC-selected harmonic count $\hat{K} \in \{0,1,2,3,4,5,6\}$. Zero means no annual seasonality was detected. |
 | `coefficients` | `np.ndarray` | Fourier coefficients $[\hat{a}_0, \hat{a}_1, \hat{b}_1, \ldots, \hat{a}_{\hat{K}}, \hat{b}_{\hat{K}}]$. Length $2\hat{K}+1$; fit on the original (non-detrended) $y_t^{(h)}$. |
 | `component` | `pd.Series` | The annual component $\hat{S}(t)$ aligned to original index (intercept excluded). |
 | `recency_amplitudes` | `dict[int, float]` | Keys 1, 2, 3 (trailing years). Values: $\sqrt{\hat{a}_1'^2 + \hat{b}_1'^2}$ from a $K=1$ fit on the linearly detrended sub-series. `NaN` if the window is shorter than 30 days. |
@@ -492,15 +498,15 @@ Returns `DecompositionResult`.  Raises `ValueError` on constraint violations; is
 
 **CUSUM threshold is fixed.** The CUSUM threshold $2\hat{\sigma}_{ref}$ and run threshold $0.5\hat{\sigma}_{ref}$ are constants.  For series with heavy-tailed noise the false-positive rate for ramp detection may be elevated; for very smooth series the detector may be over-sensitive.  A data-adaptive threshold derived from the empirical null distribution of the CUSUM statistic would be more principled but is not implemented.
 
-**Fourier phase tied to series start date.** The time index $t$ is measured in days from the first observation, not from January 1.  Comparing `annual.coefficients` across datasets with different start dates requires adjusting for the phase difference.  The `annual.component` series is always correctly aligned to the input index, so reconstruction and prediction within the fitted range are unaffected.
+**Fourier phase tied to calendar year of series start.** The time index $t$ is anchored to January 1 of the calendar year in which the series begins, not to January 1 of a fixed reference year.  Two series that start in different calendar years will have $t = 0$ at different absolute dates (e.g. Jan 1 2020 vs Jan 1 2022), so their `annual.coefficients` will carry a phase offset proportional to the difference in start-year day-of-year position.  The `annual.component` series is always correctly aligned to the input index, so reconstruction and prediction within the fitted range are unaffected.
 
 **Annual BIC detrend is linear only.** The detrend applied before BIC selection removes a single OLS linear trend.  For series with exponential or power-law growth, the residual after linear detrending retains curvature that can bias harmonic selection — typically toward higher $\hat{K}$ to absorb the unremoved curvature.  A log-transform or more flexible pre-detrending step applied externally before calling `fit()` will mitigate this.
 
-**`individual_peak_magnitude` unreliable at data boundaries.** For the last holiday occurrence in the series, the post-holiday ramp-end scan may have no data within $W$ days.  The occurrence-level effect series is accordingly truncated, and `individual_peak_magnitude` (which uses a $\pm 3$-day window from that series) may be based on few or no post-holiday observations.  Treat this field as unreliable whenever `ramp_end >= series.index[-1] - 3 days`.
+**`individual_peak_magnitude` unreliable at data boundaries.** For the last holiday occurrence in the series, the post-holiday ramp-end scan may have no data within $W$ days.  The occurrence-level effect series is accordingly truncated, and `individual_peak_magnitude` (which uses a $\pm 3$-day window from that series) may be based on few or no post-holiday observations.  The `individual_peak_magnitude_reliable` flag is set to `False` whenever the $\pm 3$-day window extends outside the series bounds, or whenever `ramp_end >= series.index[-1]` (i.e. the ramp reaches or runs past the last observation, meaning no post-holiday reference data exists to anchor the baseline).
 
 **`holiday_window` default of 14 is too small for extended retail events.** Black Friday / Cyber Monday buildups in retail data routinely begin 3–4 weeks before the date; the post-event hangover can extend 5–7 days.  The default `holiday_window=14` will systematically underdetect the pre-event ramp (CUSUM cannot accumulate sufficient signal beyond 14 days) and will force `ramp_end = h + 14` when no recovery is found.  Values of 35 or greater are recommended for BFCM and similar multi-week promotional events.
 
-**BIC harmonic ceiling of $K = 4$ may be insufficient.** The harmonic search is restricted to $K \in \{0,1,2,3,4\}$.  Series with complex annual patterns — for instance a spring peak and a separate summer peak with unequal amplitudes — may require $K = 5$ or $K = 6$ for an adequate fit.  Residual annual structure visible in `result.residual` after Stage 3 is a signal that the ceiling should be raised.  This is not currently a user-controllable parameter.
+**BIC harmonic ceiling of $K = 6$.** The harmonic search is restricted to $K \in \{0,1,2,3,4,5,6\}$.  For most daily business series this ceiling is sufficient; very unusual annual shapes with fine sub-annual structure are the exception.  Residual annual structure visible in `result.residual` after Stage 3 is a signal that the series may require pre-processing or a domain-specific model rather than additional harmonics.  The ceiling is not currently a user-controllable parameter.
 
 ---
 
