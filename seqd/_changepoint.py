@@ -106,15 +106,12 @@ def detect_changepoints(
     model.fit(signal)
     breakpoints = model.predict(pen=penalty)
 
-    # breakpoints[-1] is always n (sentinel end) — drop it
-    changepoint_indices_1based = breakpoints[:-1]
-
-    # Convert 1-based ruptures indices to 0-based positions
-    # ruptures convention: breakpoint i means segment ends at i-1 and new
-    # segment starts at i (1-indexed), so 0-based start of new segment = i-1
-    # Wait: spec says "first index of new segment" and uses r_t.index[i - 1]
-    # with 1-indexed breakpoints. Let's follow spec exactly:
-    changepoint_indices_0based = [i - 1 for i in changepoint_indices_1based]
+    # breakpoints[-1] is always n (sentinel end) — drop it.
+    # ruptures returns breakpoints as 0-indexed start positions of new segments:
+    # e.g. for a shift at index k, ruptures returns k (not k+1).
+    # These values ARE the 0-based first indices of the new segments, so no
+    # subtraction is needed.  The variable name below is kept for clarity.
+    changepoint_indices_0based = list(breakpoints[:-1])
     changepoint_dates = [r_t.index[i] for i in changepoint_indices_0based]
 
     # Defensive guard

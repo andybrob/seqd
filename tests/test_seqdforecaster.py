@@ -310,3 +310,138 @@ def test_version_bumped():
     """Package version should be 0.2.0."""
     import seqd
     assert seqd.__version__ == "0.2.0"
+
+
+# ---------------------------------------------------------------------------
+# Combination formula: full pipeline verification (Part 2 gap #6)
+# ---------------------------------------------------------------------------
+
+
+def test_combination_formula_multiplicative_pipeline():
+    """Forecast combination uses w_dow * (trend + annual + holiday), not independent multiplication.
+
+    Manually extract the three component arrays and verify that the total forecast
+    equals weekly * (trend + annual + holiday), confirming the spec formula.
+    """
+    result, _ = make_decomposition(multiplicative=True, add_holiday=False)
+    fr = SeqdForecaster(result).fit().predict(horizon=14)
+
+    trend = fr.trend_component.values
+    weekly = fr.weekly_component.values
+    annual = fr.annual_component.values
+    holiday = fr.holiday_component.values
+    forecast = fr.forecast.values
+
+    # Spec formula: ŷ(t) = w_d × (trend + annual + holiday)
+    expected = weekly * (trend + annual + holiday)
+    np.testing.assert_allclose(forecast, expected, rtol=1e-10)
+
+    # Confirm it is NOT equal to the fully-multiplicative (wrong) formula
+    wrong = weekly * trend * annual * holiday
+    assert not np.allclose(forecast, wrong), "Forecast should not equal fully-multiplicative formula"
+
+
+def test_combination_formula_additive_pipeline():
+    """Additive mode: forecast = trend + weekly + annual + holiday."""
+    result, _ = make_decomposition(multiplicative=False, add_holiday=False)
+    fr = SeqdForecaster(result).fit().predict(horizon=14)
+
+    trend = fr.trend_component.values
+    weekly = fr.weekly_component.values
+    annual = fr.annual_component.values
+    holiday = fr.holiday_component.values
+    forecast = fr.forecast.values
+
+    expected = trend + weekly + annual + holiday
+    np.testing.assert_allclose(forecast, expected, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Holiday: all occurrences unreliable → warning (Part 2 gap #7)
+# ---------------------------------------------------------------------------
+
+
+def test_all_holiday_occurrences_unreliable_emits_warning():
+    """When every occurrence has ipm_reliable=False, a warning is emitted."""
+    from seqd._structures import HolidayEffect, AnnualEffect, WeeklyEffect, DecompositionResult
+    import datetime
+
+    rng = np.random.default_rng(77)
+    n = 400
+    dates = pd.date_range("2021-01-01", periods=n, freq="D")
+    t = np.arange(n, dtype=float)
+    y = pd.Series(100.0 + 0.02 * t + rng.normal(0, 2, n), index=dates)
+
+    # Build a synthetic DecompositionResult with one holiday occurrence
+    # whose individual_peak_magnitude_reliable is False
+    he = HolidayEffect(
+        date=datetime.date(2021, 11, 26),
+        name="Test Holiday",
+        ramp_start=datetime.date(2021, 11, 20),
+        ramp_end=datetime.date(2021, 11, 29),
+        magnitude=50.0,
+        effect_series=pd.Series(
+            np.where(
+                (dates >= pd.Timestamp("2021-11-20")) & (dates <= pd.Timestamp("2021-11-29")),
+                50.0,
+                0.0,
+            ),
+            index=dates,
+        ),
+        year_magnitudes=[50.0],
+        magnitude_drift=0.0,
+        compound=False,
+        compound_block_id=None,
+        individual_peak_magnitude=50.0,
+        ramp_start_ceiling_hit=False,
+        individual_peak_magnitude_reliable=False,  # <<< unreliable
+    )
+
+    annual = AnnualEffect(n_harmonics=0, coefficients=np.array([0.0]),
+                          component=pd.Series(0.0, index=dates))
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    residual = y.copy()
+    result = DecompositionResult(
+        series=y,
+        weekly=weekly,
+        holidays=[he],
+        annual=annual,
+        residual=residual,
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    forecaster = SeqdForecaster(result)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        forecaster.fit(min_segment_size=90)
+        forecaster.predict(
+            horizon=30,
+            future_holidays={"Test Holiday": [pd.Timestamp("2022-11-25")]},
+        )
+
+    messages = [str(warning.message) for warning in w]
+    assert any(
+        "unreliable ramp shapes" in m or "ceiling hit" in m or "boundary truncation" in m
+        for m in messages
+    ), f"Expected unreliable-ramp warning, got: {messages}"
+
+
+# ---------------------------------------------------------------------------
+# No future holidays → holiday_component is zero (Part 2 gap #8)
+# ---------------------------------------------------------------------------
+
+
+def test_no_future_holidays_holiday_component_is_zero():
+    """When future_holidays is None, holiday_component must be all zeros."""
+    result, _ = make_decomposition(add_holiday=True)
+    fr = SeqdForecaster(result).fit().predict(horizon=30, future_holidays=None)
+    np.testing.assert_allclose(
+        fr.holiday_component.values,
+        0.0,
+        err_msg="holiday_component should be all zero when no future_holidays supplied",
+    )

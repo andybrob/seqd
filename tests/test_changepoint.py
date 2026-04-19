@@ -31,7 +31,7 @@ def test_constant_series_no_changepoints():
 
 
 def test_level_shift_one_changepoint():
-    """A clear level shift at the midpoint should produce one changepoint near there."""
+    """A clear level shift at the midpoint should produce one changepoint at exactly index 200."""
     n = 400
     values = np.zeros(n)
     values[200:] = 100.0
@@ -39,8 +39,10 @@ def test_level_shift_one_changepoint():
 
     dates, indices = detect_changepoints(y, penalty_beta=3.0, min_size=90)
     assert len(dates) == 1
-    # Changepoint should be within a few days of index 200
-    assert abs(indices[0] - 200) <= 5
+    # Changepoint index is the 0-based first index of the new segment (index 200).
+    assert indices[0] == 200
+    # The changepoint date corresponds to the first day of the elevated segment.
+    assert dates[0] == y.index[200]
 
 
 def test_series_too_short_returns_empty():
