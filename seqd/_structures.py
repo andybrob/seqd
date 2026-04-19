@@ -10,6 +10,115 @@ import numpy as np
 import pandas as pd
 
 
+# ---------------------------------------------------------------------------
+# V2 structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SegmentTrend:
+    """Fitted piecewise trend for one changepoint segment (Stage 5).
+
+    Attributes
+    ----------
+    segment_index : int
+        1-based segment number.
+    start_date : pd.Timestamp
+        First date of segment.
+    end_date : pd.Timestamp
+        Last date of segment (inclusive).
+    n_obs : int
+        Number of observations in segment.
+    model_type : str
+        One of ``"linear"``, ``"log"``, ``"exp"``, ``"quadratic"``,
+        ``"constant"``.
+    alpha : float
+        Intercept parameter.
+    beta : float
+        Slope parameter (0.0 for ``"constant"`` segments).
+    gamma : float or None
+        Quadratic coefficient; ``None`` unless ``model_type == "quadratic"``.
+    T_days : int
+        Segment length in calendar days (equals ``n_obs`` for daily series).
+    aic : float
+        AIC of the selected model.
+    aic_linear : float
+        AIC of the linear fit (always computed; reference for parsimony rule).
+    rss : float
+        Residual sum of squares of the selected model.
+    selected_reason : str
+        Human-readable reason for model selection.  One of:
+
+        - ``"lowest AIC"`` — best non-linear model clearly wins.
+        - ``"linear preference, ΔAIC=<val>"`` — linear parsimony applied.
+        - ``"only candidate"`` — only one model was applicable.
+        - ``"linear only"`` — linear had the lowest AIC naturally.
+    t_anchor_date : pd.Timestamp
+        Equal to ``start_date``.  For any date ``d``,
+        ``t = (d - t_anchor_date).days / (n_obs - 1)`` maps the segment onto
+        ``[0, 1]`` with ``t > 1`` for extrapolation.
+    """
+
+    segment_index: int
+    start_date: pd.Timestamp
+    end_date: pd.Timestamp
+    n_obs: int
+    model_type: str
+    alpha: float
+    beta: float
+    gamma: Optional[float]
+    T_days: int
+    aic: float
+    aic_linear: float
+    rss: float
+    selected_reason: str
+    t_anchor_date: pd.Timestamp
+
+
+@dataclass
+class ForecastResult:
+    """Out-of-sample forecast from :class:`SeqdForecaster` (Stage 6).
+
+    Attributes
+    ----------
+    forecast : pd.Series
+        Total point forecast; ``DatetimeIndex`` of length ``horizon``.
+    trend_component : pd.Series
+        Piecewise trend extrapolation; same index as ``forecast``.
+    weekly_component : pd.Series
+        DOW effects used in the forecast.  In multiplicative mode these are
+        the raw unit-mean factors ``w_d``; in additive mode they are the
+        zero-sum offsets.  Same index as ``forecast``.
+    annual_component : pd.Series
+        Fourier annual projection (intercept excluded); same index.
+    holiday_component : pd.Series
+        Projected holiday ramp effects; zero where no future holiday was
+        provided; same index.
+    changepoints : list of pd.Timestamp
+        Stage 4 detected changepoint dates.
+    segments : list of SegmentTrend
+        Stage 5 fitted segment records, ordered by ``segment_index``.
+    horizon : int
+        Forecast horizon ``H`` in days.
+    is_multiplicative : bool
+        From ``result.weekly.is_multiplicative``.
+    warnings : list of str
+        Any warnings generated during forecasting (also emitted via
+        ``warnings.warn``).
+    """
+
+    forecast: pd.Series
+    trend_component: pd.Series
+    weekly_component: pd.Series
+    annual_component: pd.Series
+    holiday_component: pd.Series
+    changepoints: List[pd.Timestamp]
+    segments: List["SegmentTrend"]
+    horizon: int
+    is_multiplicative: bool
+    warnings: List[str] = field(default_factory=list)
+
+
 @dataclass
 class WeeklyEffect:
     """Weekly day-of-week effect extracted in Stage 1.

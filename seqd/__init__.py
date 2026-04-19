@@ -28,10 +28,13 @@ import pandas as pd
 
 from ._annual import fit_annual
 from ._holiday import fit_holidays
+from ._seqdforecaster import SeqdForecaster, forecast_from_result
 from ._structures import (
     AnnualEffect,
     DecompositionResult,
+    ForecastResult,
     HolidayEffect,
+    SegmentTrend,
     WeeklyEffect,
 )
 from ._utils import all_holiday_dates_flat, normalize_holiday_input
@@ -43,9 +46,13 @@ __all__ = [
     "WeeklyEffect",
     "HolidayEffect",
     "AnnualEffect",
+    "SeqdForecaster",
+    "ForecastResult",
+    "SegmentTrend",
+    "forecast_from_result",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 class SeqdDecomposer:
