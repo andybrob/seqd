@@ -86,21 +86,24 @@ def normalize_holiday_input(
     Accepts:
     - list of date strings / date objects / Timestamps  -> {"holiday_0": [...]}
     - dict mapping name -> list of dates
+
+    Duplicate dates within any holiday group are silently deduplicated.
     """
     if isinstance(holiday_dates, dict):
         result: Dict[str, List[datetime.date]] = {}
         for name, dates in holiday_dates.items():
-            result[name] = [_to_date(d) for d in dates]
+            seen: set = set()
+            deduped = []
+            for d in dates:
+                date = _to_date(d)
+                if date not in seen:
+                    seen.add(date)
+                    deduped.append(date)
+            result[name] = deduped
         return result
     else:
         # flat list — group by "calendar date" pattern (month-day)
-        # Each unique (month, day) gets its own name
-        grouped: Dict[str, List[datetime.date]] = {}
-        for i, d in enumerate(holiday_dates):
-            date = _to_date(d)
-            key = f"holiday_{i}"
-            grouped[key] = [date]
-        # Merge same (month, day) across years
+        # Merge same (month, day) across years into one named holiday
         merged: Dict[str, List[datetime.date]] = {}
         md_to_name: Dict[tuple, str] = {}
         counter = 0
@@ -111,7 +114,9 @@ def normalize_holiday_input(
                 counter += 1
                 md_to_name[md] = name
                 merged[name] = []
-            merged[md_to_name[md]].append(d)
+            # Deduplicate: only add if not already present
+            if d not in merged[md_to_name[md]]:
+                merged[md_to_name[md]].append(d)
         return merged
 
 

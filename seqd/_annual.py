@@ -42,7 +42,12 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     for K in range(1, 5):
         X = _fourier_design(t, K)
         coef = ols_fit(X, y_h.values)
-        fitted = X @ coef
+        # Suppress spurious overflow/divide-by-zero warnings from numpy 2.0+ matmul
+        # when the result is finite (known numpy issue with float64 matmul)
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            fitted = X @ coef
+        if not np.all(np.isfinite(fitted)):
+            continue  # skip this K if result is genuinely non-finite
         rss = float(np.sum((y_h.values - fitted) ** 2))
         n_params = 2 * K + 1  # K cosine + K sine + intercept
         bic = n * np.log(max(rss / n, 1e-30)) + n_params * np.log(n)
@@ -53,12 +58,14 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     # Fit with selected K
     X = _fourier_design(t, best_K)
     coef = ols_fit(X, y_h.values)
-    fitted_full = X @ coef
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        fitted_full = X @ coef
 
     # Annual component excludes intercept (coef[0])
     X_no_intercept = X.copy()
     X_no_intercept[:, 0] = 0.0
-    annual_component = X_no_intercept @ coef
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        annual_component = X_no_intercept @ coef
 
     y_clean = pd.Series(
         y_h.values - annual_component,

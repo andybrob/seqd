@@ -213,3 +213,165 @@ def test_residual_index():
     result = decomp.fit(y)
 
     assert result.residual.index.equals(y.index)
+
+
+# ---------------------------------------------------------------------------
+# Error handling tests
+# ---------------------------------------------------------------------------
+
+
+def test_nan_in_series_raises():
+    """fit() should raise ValueError when y contains NaN values."""
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2022-01-01", periods=365, freq="D")
+    y = pd.Series(100.0 + rng.normal(0, 1.0, 365), index=dates)
+    y.iloc[42] = np.nan  # introduce a NaN
+
+    decomp = SeqdDecomposer(holiday_dates=[])
+    with pytest.raises(ValueError, match="NaN"):
+        decomp.fit(y)
+
+
+def test_non_datetime_index_raises():
+    """fit() should raise ValueError when y does not have a DatetimeIndex."""
+    y = pd.Series([1.0, 2.0, 3.0], index=[0, 1, 2])
+    decomp = SeqdDecomposer(holiday_dates=[])
+    with pytest.raises(ValueError, match="DatetimeIndex"):
+        decomp.fit(y)
+
+
+def test_gaps_in_series_raises():
+    """fit() should raise ValueError when y has date gaps larger than 1 day."""
+    dates = pd.to_datetime(["2022-01-01", "2022-01-02", "2022-01-04"])  # gap on Jan 3
+    y = pd.Series([100.0, 101.0, 103.0], index=dates)
+    decomp = SeqdDecomposer(holiday_dates=[])
+    with pytest.raises(ValueError, match="gap"):
+        decomp.fit(y)
+
+
+def test_short_series_warns_not_crashes():
+    """fit() should warn (not crash) when series is shorter than 2 * reference_window."""
+    rng = np.random.default_rng(8)
+    # reference_window=60 by default, so 2*60=120; use 50 days
+    dates = pd.date_range("2022-01-01", periods=50, freq="D")
+    y = pd.Series(100.0 + rng.normal(0, 1.0, 50), index=dates)
+
+    decomp = SeqdDecomposer(holiday_dates=[])
+    with pytest.warns(UserWarning, match="reference_window"):
+        result = decomp.fit(y)
+    # Should still return a valid result
+    assert isinstance(result, DecompositionResult)
+
+
+def test_short_series_annual_warns():
+    """fit() should warn when series is shorter than 365 days."""
+    rng = np.random.default_rng(9)
+    dates = pd.date_range("2022-01-01", periods=200, freq="D")
+    y = pd.Series(100.0 + rng.normal(0, 1.0, 200), index=dates)
+
+    decomp = SeqdDecomposer(holiday_dates=[], reference_window=30)
+    with pytest.warns(UserWarning, match="365 days"):
+        decomp.fit(y)
+
+
+# ---------------------------------------------------------------------------
+# Robustness edge case tests
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_holiday_dates_deduplicated():
+    """Duplicate dates in holiday input should be silently deduplicated."""
+    y, holiday_dates, _, _, _ = make_full_synthetic()
+    # Pass 2022-12-25 twice
+    dup_holidays = {"Christmas": [holiday_dates[0], holiday_dates[0], holiday_dates[1], holiday_dates[2]]}
+    decomp = SeqdDecomposer(holiday_dates=dup_holidays)
+    result = decomp.fit(y)
+
+    # Should still have exactly 1 HolidayEffect for Christmas
+    assert len(result.holidays) == 1
+    he = result.holidays[0]
+    # year_magnitudes should have 3 entries (one per unique occurrence), not 4
+    assert len(he.year_magnitudes) == 3, (
+        f"Expected 3 year magnitudes after dedup, got {len(he.year_magnitudes)}"
+    )
+
+
+def test_dict_named_holidays():
+    """Should accept a dict of named holidays and produce correctly named effects."""
+    rng = np.random.default_rng(11)
+    n_days = 365 * 3
+    dates = pd.date_range("2022-01-01", periods=n_days, freq="D")
+    y_vals = 100.0 + rng.normal(0, 2.0, n_days)
+    y = pd.Series(y_vals, index=dates)
+
+    # Inject spikes for two named holidays
+    for h_str in ["2022-07-04", "2023-07-04", "2022-12-25", "2023-12-25"]:
+        ts = pd.Timestamp(h_str)
+        if ts in y.index:
+            y.loc[ts] += 40.0
+
+    holidays = {
+        "IndependenceDay": [datetime.date(2022, 7, 4), datetime.date(2023, 7, 4)],
+        "Christmas": [datetime.date(2022, 12, 25), datetime.date(2023, 12, 25)],
+    }
+    decomp = SeqdDecomposer(holiday_dates=holidays)
+    result = decomp.fit(y)
+
+    he_names = {he.name for he in result.holidays}
+    assert "IndependenceDay" in he_names, f"Expected 'IndependenceDay' in {he_names}"
+    assert "Christmas" in he_names, f"Expected 'Christmas' in {he_names}"
+
+
+def test_future_holiday_skipped_gracefully():
+    """Holiday dates outside the series range should be skipped without error."""
+    rng = np.random.default_rng(12)
+    dates = pd.date_range("2022-01-01", periods=365, freq="D")
+    y = pd.Series(100.0 + rng.normal(0, 1.0, 365), index=dates)
+
+    # Holiday far in the future — not in series
+    future = {"FutureHoliday": [datetime.date(2030, 12, 25)]}
+    decomp = SeqdDecomposer(holiday_dates=future)
+    result = decomp.fit(y)
+    # Should produce 0 holiday effects (holiday not in range)
+    assert len(result.holidays) == 0
+
+
+def test_fitted_reconstructs_original():
+    """fitted() must reconstruct the original series to within floating-point tolerance."""
+    y, holiday_dates, _, _, _ = make_full_synthetic()
+    decomp = SeqdDecomposer(holiday_dates={"Christmas": holiday_dates})
+    result = decomp.fit(y)
+
+    reconstructed = result.fitted()
+    assert reconstructed.index.equals(y.index), "fitted() index does not match input"
+
+    max_diff = float(np.abs(reconstructed.values - y.values).max())
+    assert max_diff < 1e-6, (
+        f"fitted() reconstruction error {max_diff:.2e} exceeds floating-point tolerance. "
+        "Components do not sum to original series."
+    )
+
+
+def test_recency_shape():
+    """recency DataFrames should have the expected column structure and row count."""
+    y, _, _, _, _ = make_full_synthetic()
+    decomp = SeqdDecomposer(holiday_dates=[])
+    result = decomp.fit(y)
+
+    recency = result.weekly.recency
+    # For a 3-year series all three windows (60, 90, 365) should be present
+    for window in [60, 90, 365]:
+        assert window in recency, f"Window {window} missing from recency"
+        df = recency[window]
+        # Must have 'date' column and dow_0..dow_6
+        assert "date" in df.columns
+        for d in range(7):
+            assert f"dow_{d}" in df.columns
+
+        # Number of rows = number of endpoints stepped every 7 days
+        # endpoints go from n-1 back to 0 in steps of 7, sorted ascending
+        n = len(y)
+        expected_rows = len(range(n - 1, -1, -7))
+        assert len(df) == expected_rows, (
+            f"recency[{window}] has {len(df)} rows, expected {expected_rows}"
+        )

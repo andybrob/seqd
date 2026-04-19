@@ -236,6 +236,9 @@ def _recency_analysis(
     endpoints = sorted(endpoints)  # ascending
 
     for w in windows:
+        # Skip windows larger than the series length — not enough data
+        if w > n:
+            continue
         rows = []
         for end in endpoints:
             start = max(0, end - w + 1)

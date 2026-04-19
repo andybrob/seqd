@@ -20,6 +20,7 @@ Quick start
 from __future__ import annotations
 
 import datetime
+import warnings
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -100,11 +101,49 @@ class SeqdDecomposer:
         DecompositionResult
         """
         if not isinstance(y.index, pd.DatetimeIndex):
-            raise TypeError("y must have a DatetimeIndex")
+            raise ValueError("y must have a DatetimeIndex")
         if y.index.duplicated().any():
             raise ValueError("y contains duplicate dates in its index")
 
         y = y.sort_index().astype(float)
+
+        # Validate: no NaN values
+        if y.isna().any():
+            n_nan = int(y.isna().sum())
+            raise ValueError(
+                f"y contains {n_nan} NaN value(s). "
+                "Impute or drop missing values before decomposing."
+            )
+
+        # Validate: daily frequency (gaps must be exactly 1 day)
+        if len(y) >= 2:
+            diffs = y.index.to_series().diff().dropna()
+            max_gap_days = diffs.max().days
+            if max_gap_days > 1:
+                raise ValueError(
+                    f"y has gaps larger than 1 day (max gap = {max_gap_days} days). "
+                    "seqd requires a contiguous daily series."
+                )
+
+        # Warn if series is too short for reliable baseline estimation
+        if len(y) < 2 * self.reference_window:
+            warnings.warn(
+                f"Series length ({len(y)}) is less than 2 * reference_window "
+                f"({2 * self.reference_window}). Holiday baseline estimation may be "
+                "unreliable. Consider reducing reference_window or providing more data.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Warn if series is too short for reliable annual seasonality estimation
+        if len(y) < 365:
+            warnings.warn(
+                f"Series length ({len(y)}) is less than 365 days. "
+                "Annual seasonality estimates may be unreliable.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         original = y.copy()
 
         # Flatten all holiday dates for masking purposes
