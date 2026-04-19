@@ -74,14 +74,27 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     if best_K == 0:
         # Intercept-only model: no annual seasonality detected.
         # annual_component is identically zero (nothing to remove).
-        X = np.ones((n, 1))
-        coef = ols_fit(X, y_h.values)
         annual_component = np.zeros(n)
     else:
+        # Fit Fourier on the *linearly-detrended* y_h rather than raw y_h.
+        #
+        # Rationale: fitting on raw y_h embeds the mean level in the intercept
+        # and computes seasonal amplitudes relative to that global mean.  For a
+        # growing series (e.g. revenue with a strong upward trend), this means
+        # the annual component has a *fixed* amplitude equal to the average
+        # seasonal swing across the whole sample.  In early years the component
+        # over-subtracts the seasonal uplift (leaving a negative residual in
+        # those months); in later years it under-subtracts (leaving a positive
+        # residual).  The net effect is residual autocorrelation at lag 364 and
+        # a distorted seasonal pattern.
+        #
+        # Fitting on the linearly-detrended series isolates the pure cyclical
+        # component from the trend, so the Fourier coefficients represent
+        # deviations from the local trend rather than from the global mean.
+        # The annual_component (intercept excluded) is then on the correct scale
+        # to subtract from y_h.
         X = _fourier_design(t, best_K)
-        coef = ols_fit(X, y_h.values)
-        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-            fitted_full = X @ coef  # noqa: F841 — kept for symmetry / debugging
+        coef = ols_fit(X, y_h_detrended)
 
         # Annual component excludes intercept (coef[0])
         X_no_intercept = X.copy()
