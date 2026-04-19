@@ -198,6 +198,14 @@ def _process_one_holiday(
         h_date, day_to_residual, sigma_ref, holiday_window
     )
 
+    # Cap ramp_end at the last date in the series.  _detect_ramp_end uses
+    # day_to_residual.get(offset, 0.0), which returns 0 for offsets beyond the
+    # data boundary and can trigger a spurious "baseline return" one day past the
+    # last observation.  Clamp here to avoid metadata overrun.
+    series_last_date = idx_dates[-1]
+    if ramp_end > series_last_date:
+        ramp_end = series_last_date
+
     # Magnitude: mean residual over [ramp_start, ramp_end]
     ramp_days = []
     cur = ramp_start
@@ -559,9 +567,16 @@ def _build_holiday_effects(
             local_vals = occ["effect_series"].values[local_mask]
             indiv_peak = float(np.mean(local_vals)) if len(local_vals) > 0 else None
 
-            # individual_peak_magnitude_reliable: False if ±3 day window exceeds series bounds
+            # individual_peak_magnitude_reliable: False if ±3 day window exceeds series
+            # bounds, OR if the occurrence's ramp_end reaches the series end (meaning no
+            # post-holiday reference window exists to anchor the baseline, so the residual
+            # within the ±3 window is not reliably separated from the trend).
             if series_start is not None and series_end is not None:
-                ipm_reliable = (h_minus3 >= series_start) and (h_plus3 <= series_end)
+                ipm_reliable = (
+                    (h_minus3 >= series_start)
+                    and (h_plus3 <= series_end)
+                    and (occ["ramp_end"] < series_end)
+                )
             else:
                 ipm_reliable = True
 
