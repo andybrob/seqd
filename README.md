@@ -589,3 +589,279 @@ for dow, info in result.weekly.drift.items():
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     print(f"{day_names[dow]}: {info['classification']} (slope={info['slope']:.5f})")
 ```
+
+---
+
+## Stage 4–6: Trend Analysis and Forecasting (V2)
+
+V2 extends `seqd` with three post-processing stages that operate on `result.residual`
+— the trend-plus-noise series left by V1. The sequential identification principle is
+preserved: V2 consumes V1 output read-only and adds no parameters to the V1 stages.
+
+### Notation (V2 extensions)
+
+The following symbols supplement the V1 notation table in Section 2.
+
+| Symbol | Definition |
+|--------|------------|
+| $r_t$ | V1 residual series `result.residual`; trend + noise after all V1 stages |
+| $n$ | Length of $r_t$ |
+| $\tau_1 < \tau_2 < \cdots < \tau_K$ | Changepoint indices (0-based positions in $r_t$); each is the first index of the new segment |
+| $\tau_0 = 0$, $\tau_{K+1} = n$ | Sentinel boundaries |
+| $\mathcal{S}_j$ | Segment $j$: observations $r_{\tau_{j-1}}, \ldots, r_{\tau_j - 1}$ |
+| $n_j$ | Segment length: $n_j = \tau_j - \tau_{j-1}$ |
+| $t^{(j)}_i$ | Normalised time within segment $j$: $t^{(j)}_i = (i-1)/(n_j - 1)$, mapping to $[0,1]$ |
+| $T_{\text{days}}^{(j)}$ | Segment length in calendar days ($= n_j$ for a contiguous daily series) |
+| $f_j(t)$ | Fitted parametric trend for segment $j$ |
+| $\hat{\sigma}^2$ | Robust variance of $r_t$: $\hat{\sigma}^2 = \bigl(\text{MAD}(r_t)/0.6745\bigr)^2$ |
+| $\lambda$ | Per-changepoint PELT penalty: $\lambda = \hat{\sigma}^2 \cdot \beta \cdot \ln(n)$ |
+| $\beta$ | Penalty multiplier (default 3.0) |
+| $H$ | Forecast horizon in days |
+| $\hat{y}(t)$ | Total point forecast at future date $t$ |
+| $\hat{w}_d$ | Weekly DOW coefficient for day $d$ from the 60-day recency window |
+
+---
+
+### Stage 4: Changepoint Detection
+
+#### 4.1 Objective
+
+Find the partition $\{\tau_1, \ldots, \tau_K\}$ of $\{0, \ldots, n-1\}$ that minimises
+the penalised segmentation cost:
+
+$$\min_{\tau_1 < \cdots < \tau_K} \left[ \sum_{j=1}^{K+1} C(\tau_{j-1},\, \tau_j - 1) \;+\; K \cdot \lambda \right]$$
+
+#### 4.2 Cost Function
+
+The `"l2"` (least-squares mean-shift) cost for segment $[a, b]$ is:
+
+$$C(a, b) = \sum_{t=a}^{b} \!\left(r_t - \bar{r}_{[a,b]}\right)^2, \qquad \bar{r}_{[a,b]} = \frac{1}{b-a+1}\sum_{t=a}^{b} r_t$$
+
+This is the residual sum of squares from fitting a constant within the segment.
+`ruptures` evaluates $C(a,b)$ in $O(1)$ per segment using precomputed prefix sums.
+
+#### 4.3 Penalty
+
+$$\lambda = \hat{\sigma}^2 \cdot \beta \cdot \ln(n)$$
+
+where $\hat{\sigma}^2 = \bigl(\text{MAD}(r_t)/0.6745\bigr)^2$ is the robust
+(MAD-based) variance estimate and $\ln(n)$ is the BIC-standard penalty for one
+additional parameter. The multiplier $\beta = 3$ (default) corresponds to
+$1.5\times$ the two-parameter BIC cost; it suppresses over-segmentation in the
+presence of residual autocorrelation.
+
+#### 4.4 Algorithm
+
+PELT (Pruned Exact Linear Time) solves the above minimisation exactly in $O(n)$
+amortised time. Minimum segment size is 90 days (≈ one quarter), preventing false
+changepoints within sub-annual seasonal cycles.
+
+---
+
+### Stage 5: Piecewise Trend Fitting
+
+#### 5.1 Segment Normalisation
+
+For segment $\mathcal{S}_j$ of length $n_j$, the normalised time coordinate is:
+
+$$t^{(j)}_i = \frac{i - 1}{n_j - 1}, \qquad i = 1, \ldots, n_j, \quad t^{(j)} \in [0, 1]$$
+
+This normalisation is essential for numerical stability: raw day indices produce
+design-matrix condition numbers $\sim 10^6$ for 2-year segments.
+
+#### 5.2 Candidate Models
+
+Four parametric families are considered, all with $t = t^{(j)}_i \in [0,1]$:
+
+| Label | Formula | Parameters | Applicability |
+|-------|---------|-----------|--------------|
+| L (Linear) | $f_L(t) = \alpha + \beta t$ | $k_L = 2$ | Always |
+| G (Log) | $f_G(t) = \alpha + \beta \ln(1 + t \cdot T_{\text{days}}^{(j)})$ | $k_G = 2$ | Always; $\ln(\cdot) = 0$ at $t=0$, grows slowly for $t > 1$ |
+| E (Exponential) | $f_E(t) = \alpha \exp(\beta t)$ | $k_E = 2$ | Only when all $r^{(j)}_i > 0$ |
+| Q (Quadratic) | $f_Q(t) = \alpha + \beta t + \gamma t^2$ | $k_Q = 3$ | Only when $n_j \geq 5$ |
+
+Model G uses the regressor $\ln(1 + t \cdot T_{\text{days}}^{(j)})$, which equals
+zero at $t=0$ (so $\alpha$ is the segment-start value) and $\ln(1 + T_{\text{days}})$
+at $t=1$. This anchors the curvature to the physical segment length rather than the
+abstract $[0,1]$ coordinate.
+
+Model E is fit via log-linearisation: $z_i = \ln r^{(j)}_i = \ln\alpha + \beta t^{(j)}_i$,
+then OLS on $(1, t^{(j)})$ against $z$. RSS for AIC is computed on the original scale.
+
+#### 5.3 AIC Selection with Linear Parsimony
+
+For each applicable model $m$:
+
+$$\text{AIC}_m = n_j \ln\!\left(\frac{\text{RSS}_m}{n_j}\right) + 2k_m$$
+
+Identify $m^* = \arg\min_m \text{AIC}_m$, then apply the linear parsimony rule:
+
+$$\hat{m} = \begin{cases} L & \text{if } \text{AIC}_L - \text{AIC}_{m^*} < 2 \\ m^* & \text{otherwise} \end{cases}$$
+
+A difference of less than 2 AIC units provides no meaningful evidence against the
+simpler linear model (Burnham & Anderson 2002). Linear extrapolation beyond the segment
+boundary is also more stable than exponential or quadratic extrapolation.
+
+#### 5.4 Segment Record and Extrapolation
+
+Each segment produces a `SegmentTrend` storing $(\alpha, \beta, \gamma, T_{\text{days}},
+\text{model\_type}, \text{AIC}, \text{RSS})$ and a `t_anchor_date` equal to the
+segment's start date. For any date $d$ (in-sample or future):
+
+$$t(d) = \frac{(d - \text{t\_anchor\_date}).\text{days}}{n_j - 1}$$
+
+The reusable function `evaluate_segment(segment, t)` returns $f_j(t)$ for any $t$,
+including $t > 1$ for out-of-sample projection.
+
+---
+
+### Stage 6: Out-of-Sample Forecasting
+
+#### 6.1 Trend Projection
+
+Let $\mathcal{S}_{K+1}$ be the final segment (containing the last $n_{K+1}$ in-sample
+observations). For forecast step $h = 1, \ldots, H$:
+
+$$t_h = \frac{(n_{K+1} - 1) + h}{n_{K+1} - 1}$$
+
+This maps the segment start to $t = 0$, the last observed day to $t = 1$, and the first
+forecast step to $t = n_{K+1}/(n_{K+1}-1) > 1$.
+
+$$\hat{y}_{\text{trend}}(h) = \text{evaluate\_segment}\!\left(\mathcal{S}_{K+1},\; t_h\right)$$
+
+#### 6.2 Annual Projection
+
+Using the same calendar-anchored time index as V1 Stage 3 (anchor = Jan 1 of the series'
+first year):
+
+$$t_{\text{future}} = (d_{\text{future}} - t_0).\text{days}$$
+
+$$\hat{y}_{\text{annual}}(d_{\text{future}}) = \sum_{k=1}^{\hat{K}} \left[\hat{a}_k \cos\!\frac{2\pi k\, t_{\text{future}}}{P} + \hat{b}_k \sin\!\frac{2\pi k\, t_{\text{future}}}{P}\right]$$
+
+The intercept $\hat{a}_0$ is excluded (absorbed into trend level). If $\hat{K} = 0$,
+the annual component is identically zero.
+
+#### 6.3 Holiday Projection
+
+For each future holiday occurrence, project the magnitude one step ahead using OLS on
+the historical `year_magnitudes` series (linear extrapolation even with two observations,
+to preserve trend direction). Scale the most recent reliable ramp shape by the projected
+magnitude. If the most recent occurrence's shape is unreliable (`ramp_start_ceiling_hit`
+or `individual_peak_magnitude_reliable = False`), fall back to the most recent reliable
+occurrence.
+
+#### 6.4 Forecast Combination
+
+**This formula is derived from V1's reconstruction identity.** In V1 multiplicative mode,
+the weekly component is a multiplicative factor applied to the weekly-adjusted series;
+holidays and annual operate additively on that adjusted series. The V2 reconstruction
+follows directly:
+
+**Multiplicative mode** (`result.weekly.is_multiplicative = True`):
+
+$$\hat{y}(t) = \hat{w}_{\text{DOW}(t)} \times \Bigl[\hat{y}_{\text{trend}}(t) + \hat{y}_{\text{annual}}(t) + \hat{y}_{\text{holiday}}(t)\Bigr]$$
+
+where $\hat{w}_d$ is the 60-day recency DOW coefficient (unit-mean, $\bar{w} = 1$).
+
+**Additive mode** (`result.weekly.is_multiplicative = False`):
+
+$$\hat{y}(t) = \hat{y}_{\text{trend}}(t) + \hat{w}_{\text{DOW}(t)} + \hat{y}_{\text{annual}}(t) + \hat{y}_{\text{holiday}}(t)$$
+
+where $\hat{w}_d$ is the 60-day recency DOW offset (zero-sum, $\sum_d \hat{w}_d = 0$).
+
+**Why weekly multiplies the sum (not each term independently):** holiday and annual
+effects were estimated on the weekly-adjusted series $y_t^{(w)} = y_t / \hat{w}_d$.
+They are additive offsets to the adjusted level, not to the raw level. Applying $\hat{w}_d$
+multiplicatively to each term independently would double-apply the DOW scaling to
+components that already live in the adjusted domain.
+
+---
+
+### V2 API
+
+#### `SeqdForecaster`
+
+```python
+from seqd import SeqdForecaster
+
+# Step 1 — fit V1 decomposition as usual
+result = SeqdDecomposer(holiday_dates=holidays, holiday_window=50).fit(y)
+
+# Step 2 — construct forecaster and run Stages 4 + 5
+forecaster = SeqdForecaster(result)
+forecaster.fit(
+    changepoint_penalty_beta=3.0,   # β for λ = σ̂² β ln(n); range [1, 6]
+    min_segment_size=90,             # minimum segment days; default 90 (one quarter)
+    aic_linear_delta=2.0,            # AIC parsimony threshold for linear preference
+)
+
+# Inspect changepoints and segment fits after fit()
+print(forecaster.changepoints)   # list[pd.Timestamp]
+for seg in forecaster.segments:
+    print(seg.segment_index, seg.model_type, seg.alpha, seg.beta, seg.aic)
+
+# Step 3 — run Stage 6 and obtain forecast components
+fr = forecaster.predict(
+    horizon=365,
+    future_holidays={"Black Friday": [pd.Timestamp(2026, 11, 27)]},
+    max_extrapolation_days=365,
+)
+
+# ForecastResult components (all pd.Series with DatetimeIndex)
+fr.forecast          # total point forecast
+fr.trend_component   # trend extrapolation alone
+fr.weekly_component  # DOW factors (multiplicative) or offsets (additive)
+fr.annual_component  # Fourier annual projection
+fr.holiday_component # projected holiday ramp effects
+
+# Multiple horizons without re-fitting
+fr_short = forecaster.predict(horizon=90)
+fr_long  = forecaster.predict(horizon=730)
+```
+
+#### `forecast_from_result` (convenience)
+
+```python
+from seqd import forecast_from_result
+
+fr = forecast_from_result(
+    result,
+    horizon=365,
+    future_holidays={"Black Friday": [pd.Timestamp(2026, 11, 27)]},
+    changepoint_penalty_beta=3.0,
+    min_segment_size=90,
+    aic_linear_delta=2.0,
+    max_extrapolation_days=365,
+)
+```
+
+#### `ForecastResult` dataclass
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `forecast` | `pd.Series` | Total point forecast; DatetimeIndex from last date +1 to last date +H |
+| `trend_component` | `pd.Series` | Piecewise trend extrapolation |
+| `weekly_component` | `pd.Series` | DOW coefficients (multiplicative: unit-mean factors; additive: zero-sum offsets) |
+| `annual_component` | `pd.Series` | Fourier annual projection (intercept excluded) |
+| `holiday_component` | `pd.Series` | Projected holiday ramp effects; zero where no future holiday provided |
+| `changepoints` | `list[pd.Timestamp]` | Stage 4 detected changepoint dates |
+| `segments` | `list[SegmentTrend]` | Stage 5 fitted segment records, ordered by `segment_index` |
+| `horizon` | `int` | $H$ |
+| `is_multiplicative` | `bool` | From `result.weekly.is_multiplicative` |
+
+#### `SegmentTrend` dataclass
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `segment_index` | `int` | 1-based segment number |
+| `start_date`, `end_date` | `pd.Timestamp` | Segment date range |
+| `n_obs` | `int` | Number of observations |
+| `model_type` | `str` | `"linear"` \| `"log"` \| `"exp"` \| `"quadratic"` \| `"constant"` |
+| `alpha`, `beta` | `float` | Intercept and slope parameters |
+| `gamma` | `float` or `None` | Quadratic parameter; `None` unless `model_type == "quadratic"` |
+| `T_days` | `int` | Segment length in days (used in log model regressor) |
+| `aic` | `float` | AIC of selected model |
+| `aic_linear` | `float` | AIC of linear fit (always computed; reference for parsimony decision) |
+| `rss` | `float` | RSS of selected model |
+| `selected_reason` | `str` | `"lowest AIC"` / `"linear preference, ΔAIC=…"` / `"only candidate"` / `"linear only"` |
+| `t_anchor_date` | `pd.Timestamp` | = `start_date`; $t(d) = (d - \text{t\_anchor}).\text{days} / (n_{\text{obs}} - 1)$ |
