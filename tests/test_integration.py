@@ -115,9 +115,10 @@ def test_r2_by_component():
     assert "holiday" in r2
     assert "annual" in r2
 
-    # All R² should be non-negative
+    # All R² values must be in [0, 1]
     for k, v in r2.items():
         assert v >= 0, f"r2[{k}] = {v} < 0"
+        assert v <= 1.0, f"r2[{k}] = {v} > 1.0 — impossible variance fraction"
 
     # Weekly R² should be substantial given strong DOW effects
     assert r2["weekly"] > 0.01, f"Weekly R² too low: {r2['weekly']:.4f}"
@@ -287,13 +288,17 @@ def test_duplicate_holiday_dates_deduplicated():
     decomp = SeqdDecomposer(holiday_dates=dup_holidays)
     result = decomp.fit(y)
 
-    # Should still have exactly 1 HolidayEffect for Christmas
-    assert len(result.holidays) == 1
-    he = result.holidays[0]
-    # year_magnitudes should have 3 entries (one per unique occurrence), not 4
-    assert len(he.year_magnitudes) == 3, (
-        f"Expected 3 year magnitudes after dedup, got {len(he.year_magnitudes)}"
+    # After dedup: 3 unique occurrences -> 3 HolidayEffect objects
+    assert len(result.holidays) == 3, (
+        f"Expected 3 HolidayEffects (one per unique occurrence) after dedup, "
+        f"got {len(result.holidays)}"
     )
+    # All should be for Christmas and carry 3 year_magnitudes
+    for he in result.holidays:
+        assert he.name == "Christmas"
+        assert len(he.year_magnitudes) == 3, (
+            f"Expected 3 year magnitudes after dedup, got {len(he.year_magnitudes)}"
+        )
 
 
 def test_dict_named_holidays():
@@ -374,4 +379,17 @@ def test_recency_shape():
         expected_rows = len(range(n - 1, -1, -7))
         assert len(df) == expected_rows, (
             f"recency[{window}] has {len(df)} rows, expected {expected_rows}"
+        )
+
+
+def test_r2_values_between_0_and_1():
+    """R² values for all components must be in [0, 1] — impossible to explain > 100% variance."""
+    y, holiday_dates, _, _, _ = make_full_synthetic()
+    decomp = SeqdDecomposer(holiday_dates={"Christmas": holiday_dates})
+    result = decomp.fit(y)
+
+    for component, value in result.r2_by_component.items():
+        assert 0.0 <= value <= 1.0, (
+            f"r2_by_component['{component}'] = {value:.4f} is outside [0, 1]. "
+            "Variance fractions must be between 0 and 1."
         )

@@ -57,6 +57,15 @@ class HolidayEffect:
         Magnitude for each historical occurrence of this holiday (in year order).
     magnitude_drift : float
         OLS slope of magnitudes over year indices.
+    compound : bool
+        True if this holiday was merged into a compound block with other holidays.
+    compound_block_id : str or None
+        Identifier for the compound block (e.g. "compound_block_2025_1"), shared
+        across all constituent holidays merged into the same block.
+    individual_peak_magnitude : float or None
+        Mean residual within ±3 days around this specific holiday date (estimated
+        before the compound block merge). Allows distinguishing which day within
+        a merged block drove the largest effect.
     """
 
     date: datetime.date
@@ -67,6 +76,9 @@ class HolidayEffect:
     effect_series: pd.Series
     year_magnitudes: List[float] = field(default_factory=list)
     magnitude_drift: float = 0.0
+    compound: bool = False
+    compound_block_id: Optional[str] = None
+    individual_peak_magnitude: Optional[float] = None
 
 
 @dataclass

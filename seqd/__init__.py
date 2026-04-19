@@ -167,30 +167,41 @@ class SeqdDecomposer:
         # Stage 3: Annual
         annual_effect, y_clean = fit_annual(y_h=y_h)
 
-        # Compute R² by component
+        # Compute R² by component using marginal (sequential) contribution.
+        #
+        # Marginal contributions are computed from the sequential residuals already
+        # produced by the pipeline:
+        #   y       -> weekly removal  -> y_w   (residual after weekly)
+        #   y_w     -> holiday removal -> y_h   (residual after holiday)
+        #   y_h     -> annual removal  -> y_clean (final residual)
+        #
+        # r2_weekly  = 1 - var(y_w)      / var(original)
+        # r2_holiday = [var(y_w) - var(y_h)]  / var(original)
+        # r2_annual  = [var(y_h) - var(y_clean)] / var(original)
+        #
+        # Each value is the marginal variance fraction removed at that stage.
+        # Values are clipped to [0, 1] to guard against floating-point noise when
+        # components are near zero.
         var_original = float(np.var(original.values))
         r2 = {}
         if var_original > 0:
-            # weekly variance
-            dow = original.index.dayofweek
-            weekly_comp = weekly_effect.coefficients[dow]
-            if not is_mult:
-                r2["weekly"] = float(np.var(weekly_comp)) / var_original
-            else:
-                removed = original.values * (1.0 - 1.0 / weekly_comp)
-                r2["weekly"] = float(np.var(removed)) / var_original
+            var_after_weekly = float(np.var(y_w.values))
+            var_after_holiday = float(np.var(y_h.values))
+            var_final = float(np.var(y_clean.values))
 
-            # holiday variance
-            if holiday_effects:
-                total_hol = np.zeros(len(original))
-                for he in holiday_effects:
-                    total_hol += he.effect_series.reindex(original.index, fill_value=0.0).values
-                r2["holiday"] = float(np.var(total_hol)) / var_original
-            else:
-                r2["holiday"] = 0.0
-
-            # annual variance
-            r2["annual"] = float(np.var(annual_effect.component.values)) / var_original
+            r2["weekly"] = float(
+                np.clip(1.0 - var_after_weekly / var_original, 0.0, 1.0)
+            )
+            r2["holiday"] = float(
+                np.clip(
+                    (var_after_weekly - var_after_holiday) / var_original, 0.0, 1.0
+                )
+            )
+            r2["annual"] = float(
+                np.clip(
+                    (var_after_holiday - var_final) / var_original, 0.0, 1.0
+                )
+            )
         else:
             r2 = {"weekly": 0.0, "holiday": 0.0, "annual": 0.0}
 

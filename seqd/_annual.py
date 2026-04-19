@@ -37,6 +37,13 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     n = len(y_h)
     t = np.arange(n, dtype=float)  # days since first observation
 
+    # Detrend y_h with a linear OLS before BIC selection so that a strong
+    # upward (or downward) trend does not compete with the Fourier harmonics
+    # for variance.  We fit and remove the trend here for BIC selection only;
+    # the actual component fitting below uses the original y_h so that the
+    # returned annual_component and y_clean remain on the original scale.
+    y_h_detrended = _linear_detrend(y_h.values, t)
+
     # Select number of harmonics by BIC.
     # K=0 (intercept only) is included so that a series with no annual
     # seasonality is not forced to absorb a spurious Fourier harmonic.
@@ -48,14 +55,14 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
         else:
             X = _fourier_design(t, K)
             n_params = 2 * K + 1  # K cosine + K sine + intercept
-        coef = ols_fit(X, y_h.values)
+        coef = ols_fit(X, y_h_detrended)
         # Suppress spurious overflow/divide-by-zero warnings from numpy 2.0+ matmul
         # when the result is finite (known numpy issue with float64 matmul)
         with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
             fitted = X @ coef
         if not np.all(np.isfinite(fitted)):
             continue  # skip this K if result is genuinely non-finite
-        rss = float(np.sum((y_h.values - fitted) ** 2))
+        rss = float(np.sum((y_h_detrended - fitted) ** 2))
         bic = n * np.log(max(rss / n, 1e-30)) + n_params * np.log(n)
         if bic < best_bic:
             best_bic = bic
@@ -103,6 +110,17 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
 # ---------------------------------------------------------------------------
 
 
+def _linear_detrend(y: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Remove a linear OLS trend from y using t as the time axis.
+
+    Returns y minus the fitted linear trend, preserving the cyclical component.
+    """
+    X = np.column_stack([np.ones_like(t), t])
+    coef = ols_fit(X, y)
+    trend = coef[0] + coef[1] * t
+    return y - trend
+
+
 def _fourier_design(t: np.ndarray, K: int) -> np.ndarray:
     """Build Fourier design matrix with intercept.
 
@@ -117,7 +135,11 @@ def _fourier_design(t: np.ndarray, K: int) -> np.ndarray:
 
 
 def _recency_amplitudes(y_h: pd.Series, t: np.ndarray) -> Dict[int, float]:
-    """Compute K=1 Fourier amplitude on trailing [1, 2, 3]-year windows."""
+    """Compute K=1 Fourier amplitude on trailing [1, 2, 3]-year windows.
+
+    Each window is linearly detrended before fitting so that a strong trend
+    does not inflate or deflate the estimated cyclical amplitude.
+    """
     n = len(y_h)
     result = {}
     for years in [1, 2, 3]:
@@ -134,9 +156,12 @@ def _recency_amplitudes(y_h: pd.Series, t: np.ndarray) -> Dict[int, float]:
             result[years] = np.nan
             continue
 
+        # Detrend the window before Fourier fitting
+        y_win_detrended = _linear_detrend(y_win, t_win)
+
         X = _fourier_design(t_win, K=1)
         try:
-            coef = ols_fit(X, y_win)
+            coef = ols_fit(X, y_win_detrended)
             # coef = [a0, a1, b1]
             amplitude = float(np.sqrt(coef[1] ** 2 + coef[2] ** 2))
         except Exception:

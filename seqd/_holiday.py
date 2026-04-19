@@ -238,20 +238,26 @@ def _detect_ramp_start(
     sigma_ref: float,
     holiday_window: int,
 ) -> datetime.date:
-    """Backward CUSUM from h to detect ramp start.
+    """Backward CUSUM from h to detect ramp start using dual criteria.
 
-    Strategy: scan backward from the holiday date.  We accumulate excess signal
-    (|r(t)| - sigma_ref) via a standard CUSUM with reset.  The threshold is
-    3 * sigma_ref (tight enough to avoid false detections from pure noise over
-    14 steps).  The ramp_start is the *latest* (closest to h) date where the
-    CUSUM resets — i.e., the beginning of the contiguous elevated-signal run
-    that includes the holiday.  If the CUSUM never exceeds the threshold, we
-    return h_date (spike only).
+    Criterion 1 (CUSUM): cumulative excess of |r(t)| over sigma_ref exceeds
+    2 * sigma_ref.  This is sensitive to sharp, concentrated ramps.
+
+    Criterion 2 (run): 4 or more consecutive days where |r(t)| > 0.5 * sigma_ref.
+    This is sensitive to gradual, low-amplitude multi-week ramps.
+
+    ramp_start is the *earliest* date (farthest from h) where either criterion
+    first fires while scanning backwards.  If neither fires, returns h_date
+    (spike only).
     """
-    threshold = 3.0 * sigma_ref
+    cusum_threshold = 2.0 * sigma_ref
+    run_threshold = 0.5 * sigma_ref
+    run_required = 4
+
+    # CUSUM criterion: scan backwards accumulating excess
     S = 0.0
-    ramp_start = h_date  # default: spike only
-    last_reset = h_date  # track where CUSUM last reset to zero
+    cusum_ramp_start = h_date
+    last_reset = h_date
 
     for delta in range(0, holiday_window + 1):
         t = h_date - datetime.timedelta(days=delta)
@@ -261,14 +267,35 @@ def _detect_ramp_start(
         new_S = S + increment
         if new_S <= 0:
             S = 0.0
-            last_reset = t - datetime.timedelta(days=1)  # reset point just before this
+            last_reset = t - datetime.timedelta(days=1)
         else:
             S = new_S
-            if S > threshold:
-                # The ramp starts at last_reset + 1 day (first day after the reset)
-                ramp_start = last_reset + datetime.timedelta(days=1)
+            if S > cusum_threshold:
+                cusum_ramp_start = last_reset + datetime.timedelta(days=1)
 
-    return ramp_start
+    # Run criterion: find the earliest date of a run of >=run_required consecutive
+    # days above run_threshold (scanning backwards, so "earliest" = largest delta)
+    run_ramp_start = h_date
+    consecutive = 0
+    run_start_candidate = h_date
+
+    for delta in range(0, holiday_window + 1):
+        offset = -delta
+        r = day_to_residual.get(offset, 0.0)
+        if abs(r) > run_threshold:
+            if consecutive == 0:
+                run_start_candidate = h_date - datetime.timedelta(days=delta)
+            consecutive += 1
+            if consecutive >= run_required:
+                run_ramp_start = run_start_candidate
+        else:
+            consecutive = 0
+            run_start_candidate = h_date
+
+    # Use whichever criterion gives the earlier (farther back) ramp_start
+    if run_ramp_start < cusum_ramp_start:
+        return run_ramp_start
+    return cusum_ramp_start
 
 
 def _detect_ramp_end(
@@ -376,71 +403,106 @@ def _build_holiday_effects(
     idx_dates: np.ndarray,
     y_w: pd.Series,
 ) -> List[HolidayEffect]:
-    """Build final HolidayEffect objects with recency drift."""
+    """Build final HolidayEffect objects — one per occurrence (year), with recency drift.
+
+    Each occurrence of a holiday (i.e. each year) gets its own HolidayEffect so
+    that holiday_component() has non-zero values across *all* years, not just the
+    most recent one.  year_magnitudes on each HolidayEffect lists the magnitudes
+    of all occurrences of the same holiday name (for drift tracking).
+    """
     result = []
 
     # Map each original occurrence date to its merged block
     date_to_merged: Dict[datetime.date, dict] = {}
+    # Also build a block -> compound_block_id mapping (assigned on first encounter)
+    block_to_id: Dict[int, str] = {}
+    block_counter = [0]
+
     for block in merged_effects:
         for src in block["merged_from"]:
             date_to_merged[src["date"]] = block
 
-    # For each holiday name, build a single HolidayEffect using the *most recent* occurrence
-    # but aggregate recency from all occurrences
+    # Precompute per-name year_magnitudes and drift slopes so each occurrence can
+    # carry the full recency list from its holiday name group.
+    name_year_magnitudes: Dict[str, List[float]] = {}
+    name_drift: Dict[str, float] = {}
+    for name, occ_list in occurrence_data.items():
+        if not occ_list:
+            continue
+        sorted_occs = sorted(occ_list, key=lambda o: o["date"])
+        mags = [occ["magnitude"] for occ in sorted_occs]
+        name_year_magnitudes[name] = mags
+        if len(mags) >= 2:
+            x = np.arange(len(mags), dtype=float)
+            slope = ols_slope(x, np.array(mags, dtype=float))
+        else:
+            slope = 0.0
+        name_drift[name] = slope
+
+    # Build one HolidayEffect per occurrence
     for name, occ_list in occurrence_data.items():
         if not occ_list:
             continue
 
-        # Sort by date
-        occ_list = sorted(occ_list, key=lambda o: o["date"])
+        year_magnitudes = name_year_magnitudes[name]
+        slope = name_drift[name]
 
-        # Year magnitudes from each occurrence
-        year_magnitudes = [occ["magnitude"] for occ in occ_list]
-
-        # Magnitude drift: OLS slope over year indices
-        if len(year_magnitudes) >= 2:
-            x = np.arange(len(year_magnitudes), dtype=float)
-            slope = ols_slope(x, np.array(year_magnitudes, dtype=float))
-        else:
-            slope = 0.0
-
-        # Use most recent occurrence for the primary HolidayEffect
-        # but combine effect_series from all occurrences
-        combined_effect = pd.Series(0.0, index=idx)
-        seen_blocks = set()
-        for occ in occ_list:
+        for occ in sorted(occ_list, key=lambda o: o["date"]):
             h_date = occ["date"]
             block = date_to_merged.get(h_date)
-            if block is None:
-                continue
-            block_id = id(block)
-            if block_id not in seen_blocks:
-                seen_blocks.add(block_id)
-                aligned = block["effect_series"].reindex(idx, fill_value=0.0)
-                combined_effect = combined_effect + aligned
 
-        # Primary occurrence (most recent)
-        primary = occ_list[-1]
-        primary_block = date_to_merged.get(primary["date"])
-        if primary_block is None:
-            rs = primary["ramp_start"]
-            re = primary["ramp_end"]
-            mag = primary["magnitude"]
-        else:
-            rs = primary_block["ramp_start"]
-            re = primary_block["ramp_end"]
-            mag = primary_block["magnitude"]
+            # Compound block detection: block has multiple sources
+            is_compound = block is not None and len(block["merged_from"]) > 1
 
-        he = HolidayEffect(
-            date=primary["date"],
-            name=name,
-            ramp_start=rs,
-            ramp_end=re,
-            magnitude=mag,
-            effect_series=combined_effect,
-            year_magnitudes=year_magnitudes,
-            magnitude_drift=slope,
-        )
-        result.append(he)
+            # Assign a stable compound_block_id per block object
+            compound_block_id: Optional[str] = None
+            if is_compound and block is not None:
+                bid = id(block)
+                if bid not in block_to_id:
+                    # Use the year from the first date in this block
+                    first_year = block["merged_from"][0]["date"].year
+                    block_counter[0] += 1
+                    block_to_id[bid] = f"compound_block_{first_year}_{block_counter[0]}"
+                compound_block_id = block_to_id[id(block)]
+
+            # Ramp bounds: use block-level if merged, otherwise occurrence-level.
+            # NOTE: effect_series always uses the per-occurrence (pre-merge) effect so
+            # that summing all HolidayEffect.effect_series in fit_holidays does NOT
+            # double-count compound blocks.  The merged block's effect_series is the
+            # arithmetic sum of its constituent occurrence effects, so using individual
+            # effects preserves exact removal.
+            if block is not None:
+                rs = block["ramp_start"]
+                re = block["ramp_end"]
+                mag = block["magnitude"]
+            else:
+                rs = occ["ramp_start"]
+                re = occ["ramp_end"]
+                mag = occ["magnitude"]
+            # Always use the individual occurrence effect to avoid double-counting
+            effect_series = occ["effect_series"].reindex(idx, fill_value=0.0)
+
+            # individual_peak_magnitude: mean residual in ±3 days around h_date
+            # (uses occurrence-level effect_series before merge)
+            h_minus3 = h_date - datetime.timedelta(days=3)
+            h_plus3 = h_date + datetime.timedelta(days=3)
+            local_mask = (idx_dates >= h_minus3) & (idx_dates <= h_plus3)
+            local_vals = occ["effect_series"].values[local_mask]
+            indiv_peak = float(np.mean(local_vals)) if len(local_vals) > 0 else None
+
+            he = HolidayEffect(
+                date=h_date,
+                name=name,
+                ramp_start=rs,
+                ramp_end=re,
+                magnitude=mag,
+                effect_series=effect_series,
+                year_magnitudes=year_magnitudes,
+                magnitude_drift=slope,
+                compound=is_compound,
+                compound_block_id=compound_block_id,
+                individual_peak_magnitude=indiv_peak,
+            )
+            result.append(he)
 
     return result
