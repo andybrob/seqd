@@ -123,24 +123,26 @@ class SeqdForecaster:
         """
         residual = self._result.residual
 
-        # Mask compound block windows before changepoint detection.
-        # BFCM-style compound effects end abruptly at Dec 31; the resulting
-        # level-drop on Jan 1 appears as a false structural break to PELT.
-        # Interpolating through those windows suppresses ~6-8 spurious annual
-        # changepoints without affecting the final trend fit (which uses the
-        # original, unmasked residual below).
-        residual_for_detection = self._mask_compound_windows(
+        # Mask compound block windows before changepoint detection AND trend
+        # fitting.  BFCM-style compound effects end abruptly at Dec 31; the
+        # resulting level-drop on Jan 1 appears as a false structural break to
+        # PELT.  More critically, if the final segment includes the BFCM ramp,
+        # fitting the trend on the raw residual inflates the estimated slope,
+        # producing spurious +100%+ YoY growth in forecasts.  Using the
+        # compound-masked residual (linearly interpolated through each block)
+        # for both steps removes both artefacts.
+        masked_residual = self._mask_compound_windows(
             residual, self._result.holidays
         )
 
         changepoint_dates, _ = detect_changepoints(
-            residual=residual_for_detection,
+            residual=masked_residual,
             penalty_beta=changepoint_penalty_beta,
             min_size=min_segment_size,
         )
 
         segments = fit_piecewise_trend(
-            residual=residual,
+            residual=masked_residual,
             changepoint_dates=changepoint_dates,
             aic_linear_delta=aic_linear_delta,
         )
