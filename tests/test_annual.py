@@ -118,3 +118,87 @@ def test_annual_index_preserved():
 
     assert annual_effect.component.index.equals(y.index)
     assert y_clean.index.equals(y.index)
+
+
+def test_bic_can_select_k5_or_k6():
+    """BIC should be able to select K=5 when the true signal has K=5 harmonics."""
+    rng = np.random.default_rng(77)
+    n_days = int(4 * PERIOD)
+    dates = pd.date_range("2020-01-01", periods=n_days, freq="D")
+    t = np.arange(n_days, dtype=float)
+
+    # Construct signal as sum of K=5 Fourier components with clear amplitudes
+    true_annual = np.zeros(n_days)
+    for k in range(1, 6):
+        angle = 2.0 * np.pi * k * t / PERIOD
+        a_k = rng.uniform(8, 15)
+        b_k = rng.uniform(4, 10)
+        true_annual += a_k * np.cos(angle) + b_k * np.sin(angle)
+
+    trend = 100.0 + 0.005 * t
+    noise = rng.normal(0, 0.5, n_days)  # low noise so K=5 is clearly the best fit
+    y = pd.Series(trend + true_annual + noise, index=dates, name="y")
+
+    annual_effect, _ = fit_annual(y)
+    # BIC should select K=5 (or 6 if noise happens to warrant it); the important
+    # thing is it can now reach K=5 (previously the ceiling was K=4).
+    assert annual_effect.n_harmonics >= 5, (
+        f"Expected BIC to select K>=5 for a K=5 signal, got K={annual_effect.n_harmonics}"
+    )
+    assert annual_effect.n_harmonics <= 6, (
+        f"n_harmonics should be at most 6 (the new ceiling), got {annual_effect.n_harmonics}"
+    )
+
+
+def test_fourier_phase_calendar_anchored():
+    """annual_component() values at matching calendar dates should be close
+    regardless of whether the series starts Jan 1 or Jul 1."""
+    rng = np.random.default_rng(55)
+
+    # Build a true annual pattern (K=1) tied to calendar day-of-year
+    def make_series_from(start_str, n_days=int(2.5 * PERIOD)):
+        dates = pd.date_range(start_str, periods=int(n_days), freq="D")
+        t_cal = np.array(
+            [(d - pd.Timestamp(dates[0].year, 1, 1)).days for d in dates],
+            dtype=float,
+        )
+        true_annual = (
+            12.0 * np.cos(2.0 * np.pi * t_cal / PERIOD)
+            + 6.0 * np.sin(2.0 * np.pi * t_cal / PERIOD)
+        )
+        trend = 100.0 + 0.005 * np.arange(int(n_days), dtype=float)
+        noise = rng.normal(0, 0.5, int(n_days))
+        y = pd.Series(trend + true_annual + noise, index=dates, name="y")
+        return y
+
+    y_jan = make_series_from("2021-01-01")
+    y_jul = make_series_from("2021-07-01")
+
+    result_jan, _ = fit_annual(y_jan)
+    result_jul, _ = fit_annual(y_jul)
+
+    # Find the overlapping date range
+    overlap_start = max(y_jan.index[0], y_jul.index[0])
+    overlap_end = min(y_jan.index[-1], y_jul.index[-1])
+    overlap_dates = pd.date_range(overlap_start, overlap_end, freq="D")
+
+    comp_jan = result_jan.component.reindex(overlap_dates)
+    comp_jul = result_jul.component.reindex(overlap_dates)
+
+    # Drop NaN (dates not in both series)
+    mask = comp_jan.notna() & comp_jul.notna()
+    comp_jan = comp_jan[mask]
+    comp_jul = comp_jul[mask]
+
+    if len(comp_jan) == 0:
+        pytest.skip("No overlapping dates to compare")
+
+    amplitude = 12.0 + 6.0  # rough upper bound on true amplitude
+    tolerance = 0.05 * amplitude * len(comp_jan) ** 0.5  # allow 5% per-point error in RMS
+
+    rms_diff = float(np.sqrt(np.mean((comp_jan.values - comp_jul.values) ** 2)))
+    assert rms_diff < amplitude * 0.15, (
+        f"RMS difference between Jan-start and Jul-start annual components "
+        f"({rms_diff:.3f}) exceeds 15% of amplitude ({amplitude * 0.15:.3f}). "
+        "Calendar-anchored phase may not be working correctly."
+    )

@@ -393,3 +393,32 @@ def test_r2_values_between_0_and_1():
             f"r2_by_component['{component}'] = {value:.4f} is outside [0, 1]. "
             "Variance fractions must be between 0 and 1."
         )
+
+
+def test_r2_warning_on_pathological_fit():
+    """Verify the R² warning fires when holiday removal increases residual variance.
+
+    We mock fit_holidays to return a y_h with larger variance than y_w, which
+    guarantees var(y_h) > var(y_w) and triggers the holiday R² negative warning.
+    """
+    from unittest.mock import patch
+
+    rng = np.random.default_rng(500)
+    n_days = 365 * 2
+    dates = pd.date_range("2022-01-01", periods=n_days, freq="D")
+    y_vals = 100.0 + rng.normal(0, 1.0, n_days)
+    y = pd.Series(y_vals, index=dates, name="y")
+
+    def bad_fit_holidays(y_w, holidays, holiday_window, reference_window):
+        # Return a y_h with inflated variance — guaranteed negative R² for holiday stage
+        bad_y_h = y_w + np.random.default_rng(1).normal(0, 20.0, len(y_w))
+        bad_y_h = bad_y_h.set_axis(y_w.index)
+        return [], bad_y_h
+
+    decomp = SeqdDecomposer(
+        holiday_dates={"dummy": [datetime.date(2022, 6, 15), datetime.date(2023, 6, 15)]},
+    )
+
+    with patch("seqd.fit_holidays", bad_fit_holidays):
+        with pytest.warns(UserWarning, match="R\u00b2"):
+            decomp.fit(y)

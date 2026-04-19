@@ -80,11 +80,13 @@ class SeqdDecomposer:
         ],
         multiplicative: Optional[bool] = None,
         holiday_window: int = 14,
+        max_holiday_window: Optional[int] = None,
         reference_window: int = 60,
     ) -> None:
         self.holidays = normalize_holiday_input(holiday_dates)
         self.multiplicative = multiplicative
         self.holiday_window = holiday_window
+        self.max_holiday_window = max_holiday_window
         self.reference_window = reference_window
 
     def fit(self, y: pd.Series) -> DecompositionResult:
@@ -157,10 +159,11 @@ class SeqdDecomposer:
         )
 
         # Stage 2: Holiday
+        effective_window = self.max_holiday_window if self.max_holiday_window is not None else self.holiday_window
         holiday_effects, y_h = fit_holidays(
             y_w=y_w,
             holidays=self.holidays,
-            holiday_window=self.holiday_window,
+            holiday_window=effective_window,
             reference_window=self.reference_window,
         )
 
@@ -189,19 +192,26 @@ class SeqdDecomposer:
             var_after_holiday = float(np.var(y_h.values))
             var_final = float(np.var(y_clean.values))
 
-            r2["weekly"] = float(
-                np.clip(1.0 - var_after_weekly / var_original, 0.0, 1.0)
-            )
-            r2["holiday"] = float(
-                np.clip(
-                    (var_after_weekly - var_after_holiday) / var_original, 0.0, 1.0
-                )
-            )
-            r2["annual"] = float(
-                np.clip(
-                    (var_after_holiday - var_final) / var_original, 0.0, 1.0
-                )
-            )
+            r2_weekly_raw = 1.0 - (var_after_weekly / var_original)
+            r2_holiday_raw = (var_after_weekly - var_after_holiday) / var_original
+            r2_annual_raw = (var_after_holiday - var_final) / var_original
+
+            _component_stage = {"weekly": 1, "holiday": 2, "annual": 3}
+            for _cname, _raw in [("weekly", r2_weekly_raw), ("holiday", r2_holiday_raw), ("annual", r2_annual_raw)]:
+                if _raw < -0.01:  # tolerance for float noise
+                    warnings.warn(
+                        f"R² for '{_cname}' component is {_raw:.4f} (negative). "
+                        f"Stage {_component_stage[_cname]} increased residual variance. "
+                        "Decomposition may be unreliable. Check holiday_window and reference_window.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+
+            r2 = {
+                "weekly": float(np.clip(r2_weekly_raw, 0.0, 1.0)),
+                "holiday": float(np.clip(r2_holiday_raw, 0.0, 1.0)),
+                "annual": float(np.clip(r2_annual_raw, 0.0, 1.0)),
+            }
         else:
             r2 = {"weekly": 0.0, "holiday": 0.0, "annual": 0.0}
 

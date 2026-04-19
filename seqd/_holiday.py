@@ -88,7 +88,10 @@ def fit_holidays(
 
     # Build HolidayEffect objects grouped by holiday name
     holiday_effects = _build_holiday_effects(
-        occurrence_data, merged_effects, idx, idx_dates, y_w
+        occurrence_data, merged_effects, idx, idx_dates, y_w,
+        holiday_window=holiday_window,
+        series_start=y_w.index[0].date(),
+        series_end=y_w.index[-1].date(),
     )
 
     # Sum all effects and remove from y_w
@@ -327,7 +330,12 @@ def _detect_ramp_end(
     sigma_ref: float,
     holiday_window: int,
 ) -> datetime.date:
-    """Forward scan from h+1 to find baseline return."""
+    """Forward scan from h+1 to find baseline return.
+
+    Applies a 3-point median smoothing to the residuals before checking the
+    consecutive-pair threshold criterion. This reduces false early exits caused
+    by isolated noisy days within an otherwise active ramp.
+    """
     threshold_return = 1.5 * sigma_ref
     consecutive = 0
     # Default: full search window (not a hardcoded 7-day fallback).
@@ -338,8 +346,13 @@ def _detect_ramp_end(
     for delta in range(1, holiday_window + 1):
         t = h_date + datetime.timedelta(days=delta)
         offset = delta
-        r = day_to_residual.get(offset, 0.0)
-        if abs(r) < threshold_return:
+        # 3-point median smoothing: median of [r(t-1), r(t), r(t+1)]
+        # Boundary values use the existing .get(offset, 0.0) convention
+        r_prev = day_to_residual.get(offset - 1, 0.0)
+        r_curr = day_to_residual.get(offset, 0.0)
+        r_next = day_to_residual.get(offset + 1, 0.0)
+        r_smooth = float(np.median([r_prev, r_curr, r_next]))
+        if abs(r_smooth) < threshold_return:
             consecutive += 1
             if consecutive >= 2:
                 # ramp_end is 2 days back (first of the two consecutive small days)
@@ -433,6 +446,9 @@ def _build_holiday_effects(
     idx: pd.DatetimeIndex,
     idx_dates: np.ndarray,
     y_w: pd.Series,
+    holiday_window: int = 14,
+    series_start: Optional[datetime.date] = None,
+    series_end: Optional[datetime.date] = None,
 ) -> List[HolidayEffect]:
     """Build final HolidayEffect objects — one per occurrence (year), with recency drift.
 
@@ -543,6 +559,17 @@ def _build_holiday_effects(
             local_vals = occ["effect_series"].values[local_mask]
             indiv_peak = float(np.mean(local_vals)) if len(local_vals) > 0 else None
 
+            # individual_peak_magnitude_reliable: False if ±3 day window exceeds series bounds
+            if series_start is not None and series_end is not None:
+                ipm_reliable = (h_minus3 >= series_start) and (h_plus3 <= series_end)
+            else:
+                ipm_reliable = True
+
+            # ramp_start_ceiling_hit: True if ramp_start reached the search boundary
+            ceiling_date = occ["date"] - datetime.timedelta(days=holiday_window)
+            occ_ramp_start = occ["ramp_start"]
+            ceiling_hit = (occ_ramp_start <= ceiling_date + datetime.timedelta(days=1))
+
             he = HolidayEffect(
                 date=h_date,
                 name=name,
@@ -555,6 +582,8 @@ def _build_holiday_effects(
                 compound=is_compound,
                 compound_block_id=compound_block_id,
                 individual_peak_magnitude=indiv_peak,
+                ramp_start_ceiling_hit=ceiling_hit,
+                individual_peak_magnitude_reliable=ipm_reliable,
             )
             result.append(he)
 

@@ -79,6 +79,8 @@ class HolidayEffect:
     compound: bool = False
     compound_block_id: Optional[str] = None
     individual_peak_magnitude: Optional[float] = None
+    ramp_start_ceiling_hit: bool = False
+    individual_peak_magnitude_reliable: bool = True
 
 
 @dataclass
@@ -88,7 +90,7 @@ class AnnualEffect:
     Attributes
     ----------
     n_harmonics : int
-        Number of Fourier harmonics selected by BIC.
+        Number of Fourier harmonics selected by BIC. K ∈ {0,1,...,6}.
     coefficients : np.ndarray
         Fourier coefficients [a0, a1, b1, a2, b2, ...] where a0 is the intercept.
     component : pd.Series

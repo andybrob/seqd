@@ -289,6 +289,96 @@ def test_run_criterion_detects_gradual_ramp():
     )
 
 
+def test_ramp_start_ceiling_hit_flag():
+    """ramp_start_ceiling_hit should be True when ramp is longer than holiday_window."""
+    rng = np.random.default_rng(300)
+    n_days = 365 * 3
+    dates = pd.date_range("2022-01-01", periods=n_days, freq="D")
+    trend = np.linspace(100.0, 110.0, n_days)
+    noise = rng.normal(0, 0.3, n_days)  # low noise
+    y = pd.Series(trend + noise, index=dates, name="y")
+
+    # Create a very long ramp (40 days) that exceeds holiday_window=20
+    h_dates = [datetime.date(2022, 12, 25), datetime.date(2023, 12, 25)]
+    for h in h_dates:
+        h_ts = pd.Timestamp(h)
+        if h_ts not in y.index:
+            continue
+        for delta in range(-40, 5):
+            d_ts = h_ts + pd.Timedelta(days=delta)
+            if d_ts in y.index:
+                factor = max(0.0, 1.0 - abs(delta) / 41.0)
+                y.loc[d_ts] += factor * 30.0
+
+    holidays = {"Christmas": h_dates}
+    he_list, _ = fit_holidays(y_w=y, holidays=holidays, holiday_window=20)
+
+    # At least one of the occurrences should hit the ceiling
+    hit_flags = [he.ramp_start_ceiling_hit for he in he_list]
+    assert any(hit_flags), (
+        f"Expected at least one ramp_start_ceiling_hit=True for a 40-day ramp "
+        f"with holiday_window=20. Flags: {hit_flags}"
+    )
+
+
+def test_ramp_start_no_ceiling_hit():
+    """ramp_start_ceiling_hit should be False when ramp is shorter than holiday_window."""
+    rng = np.random.default_rng(301)
+    n_days = 365 * 3
+    dates = pd.date_range("2022-01-01", periods=n_days, freq="D")
+    trend = np.linspace(100.0, 110.0, n_days)
+    noise = rng.normal(0, 0.3, n_days)  # low noise
+    y = pd.Series(trend + noise, index=dates, name="y")
+
+    # Short ramp: 7 days before, well within holiday_window=35
+    h_dates = [datetime.date(2022, 12, 25), datetime.date(2023, 12, 25)]
+    for h in h_dates:
+        h_ts = pd.Timestamp(h)
+        if h_ts not in y.index:
+            continue
+        for delta in range(-7, 5):
+            d_ts = h_ts + pd.Timedelta(days=delta)
+            if d_ts in y.index:
+                factor = max(0.0, 1.0 - abs(delta) / 8.0)
+                y.loc[d_ts] += factor * 30.0
+
+    holidays = {"Christmas": h_dates}
+    he_list, _ = fit_holidays(y_w=y, holidays=holidays, holiday_window=35)
+
+    # None should hit the ceiling with a short ramp and large window
+    hit_flags = [he.ramp_start_ceiling_hit for he in he_list]
+    assert not any(hit_flags), (
+        f"Expected all ramp_start_ceiling_hit=False for a short 7-day ramp "
+        f"with holiday_window=35. Flags: {hit_flags}"
+    )
+
+
+def test_individual_peak_magnitude_reliable_boundary():
+    """Holidays within 3 days of series start/end should have ipm_reliable=False."""
+    rng = np.random.default_rng(302)
+    # Use exactly 1 year so the last holiday of the year is near the series end
+    dates = pd.date_range("2022-01-01", periods=365, freq="D")
+    y = pd.Series(100.0 + rng.normal(0, 1.0, 365), index=dates, name="y")
+
+    # Holiday on Dec 30 — only 1 day before series end (Dec 31), so h+3 exceeds end
+    h_date = datetime.date(2022, 12, 30)
+    h_ts = pd.Timestamp(h_date)
+    if h_ts in y.index:
+        y.loc[h_ts] += 30.0
+
+    holidays = {"LateHoliday": [h_date]}
+    he_list, _ = fit_holidays(y_w=y, holidays=holidays)
+
+    assert len(he_list) >= 1
+    # Find the late-year holiday
+    late_he = next((he for he in he_list if he.date == h_date), None)
+    assert late_he is not None, f"HolidayEffect for {h_date} not found"
+    assert late_he.individual_peak_magnitude_reliable is False, (
+        f"Expected individual_peak_magnitude_reliable=False for holiday on {h_date} "
+        f"(series ends {dates[-1].date()}), but got True"
+    )
+
+
 def test_holiday_component_nonzero_all_years():
     """holiday_component() must have non-zero values in all years of a multi-year input."""
     from seqd import SeqdDecomposer

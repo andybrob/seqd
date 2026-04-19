@@ -35,7 +35,9 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     y_h = y_h.copy().astype(float)
     idx = y_h.index
     n = len(y_h)
-    t = np.arange(n, dtype=float)  # days since first observation
+    # Anchor t=0 to January 1 of the series' first year for calendar-aligned phase
+    t0_date = pd.Timestamp(idx[0].year, 1, 1)
+    t = np.array([(d - t0_date).days for d in idx], dtype=float)
 
     # Detrend y_h with a linear OLS before BIC selection so that a strong
     # upward (or downward) trend does not compete with the Fourier harmonics
@@ -48,7 +50,7 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     # K=0 (intercept only) is included so that a series with no annual
     # seasonality is not forced to absorb a spurious Fourier harmonic.
     best_K, best_bic = 0, np.inf
-    for K in range(0, 5):
+    for K in range(0, 7):
         if K == 0:
             X = np.ones((n, 1))
             n_params = 1
