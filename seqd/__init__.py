@@ -70,6 +70,12 @@ class SeqdDecomposer:
         Days before/after each holiday to search for ramp effects. Default 14.
     reference_window : int
         Days used for baseline estimation pre/post the holiday gap. Default 60.
+    max_compound_block_days : int
+        Maximum span (in days) allowed when merging overlapping ramp windows into
+        a compound block.  If merging would create a block spanning more than this
+        many days, the merge is skipped.  Default 90 (backward-compatible).
+        Set to ~50 to prevent the Q4 Thanksgiving/BF/CM/Christmas cluster from
+        absorbing the Christmas and NYE ramps.
     """
 
     def __init__(
@@ -82,12 +88,14 @@ class SeqdDecomposer:
         holiday_window: int = 14,
         max_holiday_window: Optional[int] = None,
         reference_window: int = 60,
+        max_compound_block_days: int = 90,
     ) -> None:
         self.holidays = normalize_holiday_input(holiday_dates)
         self.multiplicative = multiplicative
         self.holiday_window = holiday_window
         self.max_holiday_window = max_holiday_window
         self.reference_window = reference_window
+        self.max_compound_block_days = max_compound_block_days
 
     def fit(self, y: pd.Series) -> DecompositionResult:
         """Fit the decomposition on the input series.
@@ -165,6 +173,7 @@ class SeqdDecomposer:
             holidays=self.holidays,
             holiday_window=effective_window,
             reference_window=self.reference_window,
+            max_compound_block_days=self.max_compound_block_days,
         )
 
         # Stage 3: Annual

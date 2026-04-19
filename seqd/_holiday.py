@@ -23,6 +23,7 @@ def fit_holidays(
     holiday_window: int = 14,
     reference_window: int = 60,
     reference_gap: int = 14,
+    max_compound_block_days: int = 90,
 ) -> Tuple[List[HolidayEffect], pd.Series]:
     """Fit and remove holiday effects from the weekly-adjusted series.
 
@@ -38,6 +39,12 @@ def fit_holidays(
         Days before/after the gap used as reference baseline.
     reference_gap : int
         Days before/after holiday excluded from baseline estimation.
+    max_compound_block_days : int
+        Maximum span (in days) allowed for a compound block formed by merging
+        overlapping ramp windows.  If merging two groups would create a combined
+        span exceeding this limit, the merge is skipped and the groups remain as
+        separate compound blocks.  Default 90 (effectively unlimited — preserves
+        backward-compatible behaviour).
 
     Returns
     -------
@@ -84,7 +91,10 @@ def fit_holidays(
             all_occurrences.append((name, occ))
 
     # Merge overlapping windows
-    merged_effects = _merge_overlapping(all_occurrences, idx, idx_dates)
+    merged_effects = _merge_overlapping(
+        all_occurrences, idx, idx_dates,
+        max_compound_block_days=max_compound_block_days,
+    )
 
     # Build HolidayEffect objects grouped by holiday name
     holiday_effects = _build_holiday_effects(
@@ -381,8 +391,14 @@ def _merge_overlapping(
     all_occurrences: list,
     idx: pd.DatetimeIndex,
     idx_dates: np.ndarray,
+    max_compound_block_days: int = 90,
 ) -> List[dict]:
-    """Merge overlapping ramp windows into compound blocks."""
+    """Merge overlapping ramp windows into compound blocks.
+
+    Two groups are merged only if their ramp windows overlap *and* the resulting
+    combined span does not exceed ``max_compound_block_days``.  When merging
+    would exceed the limit the incoming event starts a new group instead.
+    """
     if not all_occurrences:
         return []
 
@@ -405,17 +421,28 @@ def _merge_overlapping(
 
     for ev in events[1:]:
         if ev["ramp_start"] <= current["ramp_end"]:
-            # Overlapping — merge
-            current["ramp_end"] = max(current["ramp_end"], ev["ramp_end"])
-            current["ramp_start"] = min(current["ramp_start"], ev["ramp_start"])
-            current["merged_from"].append(ev)
-            # Accumulate sum into a running total stored temporarily; we'll divide
-            # by n_members at the end to get the mean (canonical) effect.
-            current["_effect_sum"] = (
-                current.get("_effect_sum",
-                            current["effect_series"].reindex(idx, fill_value=0.0))
-                + ev["effect_series"].reindex(idx, fill_value=0.0)
-            )
+            # Windows overlap — check whether the combined span would exceed the limit
+            proposed_start = min(current["ramp_start"], ev["ramp_start"])
+            proposed_end = max(current["ramp_end"], ev["ramp_end"])
+            proposed_span = (proposed_end - proposed_start).days
+
+            if proposed_span > max_compound_block_days:
+                # Span limit exceeded — close current group and start a new one
+                merged.append(current)
+                current = ev.copy()
+                current["merged_from"] = [ev]
+            else:
+                # Safe to merge
+                current["ramp_end"] = proposed_end
+                current["ramp_start"] = proposed_start
+                current["merged_from"].append(ev)
+                # Accumulate sum into a running total stored temporarily; we'll divide
+                # by n_members at the end to get the mean (canonical) effect.
+                current["_effect_sum"] = (
+                    current.get("_effect_sum",
+                                current["effect_series"].reindex(idx, fill_value=0.0))
+                    + ev["effect_series"].reindex(idx, fill_value=0.0)
+                )
         else:
             merged.append(current)
             current = ev.copy()

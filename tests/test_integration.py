@@ -409,7 +409,7 @@ def test_r2_warning_on_pathological_fit():
     y_vals = 100.0 + rng.normal(0, 1.0, n_days)
     y = pd.Series(y_vals, index=dates, name="y")
 
-    def bad_fit_holidays(y_w, holidays, holiday_window, reference_window):
+    def bad_fit_holidays(y_w, holidays, holiday_window, reference_window, **kwargs):
         # Return a y_h with inflated variance — guaranteed negative R² for holiday stage
         bad_y_h = y_w + np.random.default_rng(1).normal(0, 20.0, len(y_w))
         bad_y_h = bad_y_h.set_axis(y_w.index)

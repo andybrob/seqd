@@ -410,3 +410,68 @@ def test_holiday_component_nonzero_all_years():
         assert (window != 0.0).any(), (
             f"holiday_component() is all-zero around {h} — multi-year detection failed"
         )
+
+
+def test_max_compound_block_days_limits_merge():
+    """max_compound_block_days must prevent two holidays from forming a compound
+    block whose span exceeds the limit.
+
+    Two named holidays 10 days apart, each with a strong 8-day-wide effect, are
+    injected so their CUSUM-detected ramp windows overlap (span ~33 days together).
+    With max_compound_block_days=25 the merge is blocked; with the default of 90
+    they are allowed to merge into one compound block.
+    """
+    rng = np.random.default_rng(50)
+    dates = pd.date_range("2023-01-01", periods=365 * 2, freq="D")
+    y = pd.Series(100.0 + rng.normal(0, 1.0, len(dates)), index=dates, name="y")
+
+    # Two holidays 10 days apart with wide (±8 day) effects so ramp windows overlap
+    h1_dates = [datetime.date(2023, 10, 5), datetime.date(2024, 10, 5)]
+    h2_dates = [datetime.date(2023, 10, 15), datetime.date(2024, 10, 15)]
+
+    for dates_list in [h1_dates, h2_dates]:
+        for h in dates_list:
+            for delta in range(-8, 9):
+                d_ts = pd.Timestamp(h) + pd.Timedelta(days=delta)
+                if d_ts in y.index:
+                    y.loc[d_ts] += 25.0
+
+    holidays = {"HolidayA": h1_dates, "HolidayB": h2_dates}
+
+    # --- Without limit (default=90): overlapping windows should merge ---
+    he_list_unlimited, _ = fit_holidays(
+        y_w=y, holidays=holidays, holiday_window=14,
+        max_compound_block_days=90,
+    )
+    merged_block_ids = {
+        he.compound_block_id for he in he_list_unlimited
+        if he.compound and he.compound_block_id is not None
+    }
+    # With no limit the two nearby holidays should share at least one compound block
+    assert len(merged_block_ids) >= 1, (
+        f"Expected at least 1 compound block with default limit, "
+        f"got block_ids={merged_block_ids}"
+    )
+
+    # --- With tight limit (25 days < ~33-day combined span): no merge ---
+    he_list_limited, _ = fit_holidays(
+        y_w=y, holidays=holidays, holiday_window=14,
+        max_compound_block_days=25,
+    )
+    limited_block_ids = {
+        he.compound_block_id for he in he_list_limited
+        if he.compound and he.compound_block_id is not None
+    }
+    # None of the occurrences should share a compound block that spans both holidays
+    # (they should be either non-compound, or in separate per-holiday blocks)
+    # Specifically: no compound block should contain both HolidayA and HolidayB dates
+    from collections import defaultdict
+    block_names: dict = defaultdict(set)
+    for he in he_list_limited:
+        if he.compound and he.compound_block_id is not None:
+            block_names[he.compound_block_id].add(he.name)
+    for bid, names in block_names.items():
+        assert not ({"HolidayA", "HolidayB"} <= names), (
+            f"Block {bid} spans both HolidayA and HolidayB despite "
+            f"max_compound_block_days=25 — limit was not enforced"
+        )
