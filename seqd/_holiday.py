@@ -23,7 +23,7 @@ def fit_holidays(
     holiday_window: int = 14,
     reference_window: int = 60,
     reference_gap: int = 14,
-    max_compound_block_days: int = 90,
+    max_holiday_merge_gap_days: int = 7,
 ) -> Tuple[List[HolidayEffect], pd.Series]:
     """Fit and remove holiday effects from the weekly-adjusted series.
 
@@ -39,12 +39,14 @@ def fit_holidays(
         Days before/after the gap used as reference baseline.
     reference_gap : int
         Days before/after holiday excluded from baseline estimation.
-    max_compound_block_days : int
-        Maximum span (in days) allowed for a compound block formed by merging
-        overlapping ramp windows.  If merging two groups would create a combined
-        span exceeding this limit, the merge is skipped and the groups remain as
-        separate compound blocks.  Default 90 (effectively unlimited — preserves
-        backward-compatible behaviour).
+    max_holiday_merge_gap_days : int
+        Two HolidayEffect occurrences are merged into a compound block only when
+        the minimum gap between any holiday date in one group and any holiday date
+        in the other group is ≤ this value (in days).  Default 7.  This criterion
+        is based on calendar proximity of the actual holiday dates, not on whether
+        their ramp windows overlap — so it is stable with respect to holiday_window
+        size.  Set to 3 to merge only back-to-back holidays; set to 30 to merge
+        all of BFCM plus Christmas into one block.
 
     Returns
     -------
@@ -93,7 +95,7 @@ def fit_holidays(
     # Merge overlapping windows
     merged_effects = _merge_overlapping(
         all_occurrences, idx, idx_dates,
-        max_compound_block_days=max_compound_block_days,
+        max_holiday_merge_gap_days=max_holiday_merge_gap_days,
     )
 
     # Build HolidayEffect objects grouped by holiday name
@@ -391,18 +393,26 @@ def _merge_overlapping(
     all_occurrences: list,
     idx: pd.DatetimeIndex,
     idx_dates: np.ndarray,
-    max_compound_block_days: int = 90,
+    max_holiday_merge_gap_days: int = 7,
 ) -> List[dict]:
-    """Merge overlapping ramp windows into compound blocks.
+    """Merge holiday occurrences into compound blocks based on calendar proximity.
 
-    Two groups are merged only if their ramp windows overlap *and* the resulting
-    combined span does not exceed ``max_compound_block_days``.  When merging
-    would exceed the limit the incoming event starts a new group instead.
+    Two groups are merged if and only if the minimum gap between any holiday date
+    in one group and any holiday date in the other group is ≤
+    ``max_holiday_merge_gap_days``.  This criterion is stable with respect to
+    ``holiday_window`` size — it depends only on the actual calendar dates of the
+    holidays, not on how wide their ramp windows are.
+
+    Examples (default max_holiday_merge_gap_days=7):
+    - Thanksgiving (Nov 26) + Black Friday (Nov 27): gap=1 → MERGE
+    - Black Friday (Nov 27) + Cyber Monday (Nov 30): gap=3 → MERGE
+    - Cyber Monday (Nov 30) + Christmas (Dec 25): gap=25 → DO NOT MERGE
+    - Christmas (Dec 25) + New Year's Eve (Dec 31): gap=6 → MERGE
     """
     if not all_occurrences:
         return []
 
-    # Sort by ramp_start
+    # Build event list sorted by holiday date
     events = []
     for name, occ in all_occurrences:
         events.append({
@@ -413,42 +423,46 @@ def _merge_overlapping(
             "magnitude": occ["magnitude"],
             "effect_series": occ["effect_series"],
         })
-    events.sort(key=lambda e: e["ramp_start"])
+    events.sort(key=lambda e: e["date"])
 
+    # Group events: each group accumulates a set of holiday dates.
+    # A new event joins the current group iff its holiday date is within
+    # max_holiday_merge_gap_days of the *nearest* date already in the group.
     merged = []
     current = events[0].copy()
     current["merged_from"] = [events[0]]
+    current["_group_dates"] = {events[0]["date"]}
 
     for ev in events[1:]:
-        if ev["ramp_start"] <= current["ramp_end"]:
-            # Windows overlap — check whether the combined span would exceed the limit
-            proposed_start = min(current["ramp_start"], ev["ramp_start"])
-            proposed_end = max(current["ramp_end"], ev["ramp_end"])
-            proposed_span = (proposed_end - proposed_start).days
-
-            if proposed_span > max_compound_block_days:
-                # Span limit exceeded — close current group and start a new one
-                merged.append(current)
-                current = ev.copy()
-                current["merged_from"] = [ev]
-            else:
-                # Safe to merge
-                current["ramp_end"] = proposed_end
-                current["ramp_start"] = proposed_start
-                current["merged_from"].append(ev)
-                # Accumulate sum into a running total stored temporarily; we'll divide
-                # by n_members at the end to get the mean (canonical) effect.
-                current["_effect_sum"] = (
-                    current.get("_effect_sum",
-                                current["effect_series"].reindex(idx, fill_value=0.0))
-                    + ev["effect_series"].reindex(idx, fill_value=0.0)
-                )
+        ev_date = ev["date"]
+        # Minimum gap between ev_date and all dates already in the current group
+        min_gap = min(
+            abs((ev_date - d).days) for d in current["_group_dates"]
+        )
+        if min_gap <= max_holiday_merge_gap_days:
+            # Close enough — merge into current group
+            current["ramp_end"] = max(current["ramp_end"], ev["ramp_end"])
+            current["ramp_start"] = min(current["ramp_start"], ev["ramp_start"])
+            current["merged_from"].append(ev)
+            current["_group_dates"].add(ev_date)
+            # Accumulate sum into a running total; divide by n_members at end.
+            current["_effect_sum"] = (
+                current.get("_effect_sum",
+                            current["effect_series"].reindex(idx, fill_value=0.0))
+                + ev["effect_series"].reindex(idx, fill_value=0.0)
+            )
         else:
+            # Too far apart — close the current group and start a new one
             merged.append(current)
             current = ev.copy()
             current["merged_from"] = [ev]
+            current["_group_dates"] = {ev_date}
 
     merged.append(current)
+
+    # Clean up the temporary _group_dates field
+    for block in merged:
+        block.pop("_group_dates", None)
 
     # For merged blocks with multiple events, finalise effect_series as the MEAN
     # of the constituent individual effects (not the sum), then recompute magnitude.

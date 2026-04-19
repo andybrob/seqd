@@ -70,12 +70,12 @@ class SeqdDecomposer:
         Days before/after each holiday to search for ramp effects. Default 14.
     reference_window : int
         Days used for baseline estimation pre/post the holiday gap. Default 60.
-    max_compound_block_days : int
-        Maximum span (in days) allowed when merging overlapping ramp windows into
-        a compound block.  If merging would create a block spanning more than this
-        many days, the merge is skipped.  Default 90 (backward-compatible).
-        Set to ~50 to prevent the Q4 Thanksgiving/BF/CM/Christmas cluster from
-        absorbing the Christmas and NYE ramps.
+    max_holiday_merge_gap_days : int
+        Two holiday occurrences are merged into a compound block only when the
+        minimum gap between their actual calendar dates is ≤ this value (days).
+        Default 7.  Thanksgiving + Black Friday (gap=1) and Black Friday + Cyber
+        Monday (gap=3) will merge; Cyber Monday + Christmas (gap=25) will not.
+        This criterion is independent of ``holiday_window`` size.
     """
 
     def __init__(
@@ -88,14 +88,14 @@ class SeqdDecomposer:
         holiday_window: int = 14,
         max_holiday_window: Optional[int] = None,
         reference_window: int = 60,
-        max_compound_block_days: int = 90,
+        max_holiday_merge_gap_days: int = 7,
     ) -> None:
         self.holidays = normalize_holiday_input(holiday_dates)
         self.multiplicative = multiplicative
         self.holiday_window = holiday_window
         self.max_holiday_window = max_holiday_window
         self.reference_window = reference_window
-        self.max_compound_block_days = max_compound_block_days
+        self.max_holiday_merge_gap_days = max_holiday_merge_gap_days
 
     def fit(self, y: pd.Series) -> DecompositionResult:
         """Fit the decomposition on the input series.
@@ -173,7 +173,7 @@ class SeqdDecomposer:
             holidays=self.holidays,
             holiday_window=effective_window,
             reference_window=self.reference_window,
-            max_compound_block_days=self.max_compound_block_days,
+            max_holiday_merge_gap_days=self.max_holiday_merge_gap_days,
         )
 
         # Stage 3: Annual
