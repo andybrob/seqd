@@ -273,24 +273,47 @@ def _detect_ramp_start(
             if S > cusum_threshold:
                 cusum_ramp_start = last_reset + datetime.timedelta(days=1)
 
-    # Run criterion: find the earliest date of a run of >=run_required consecutive
-    # days above run_threshold (scanning backwards, so "earliest" = largest delta)
-    run_ramp_start = h_date
-    consecutive = 0
-    run_start_candidate = h_date
+    # Run criterion: find earliest point in any run of 4+ consecutive elevated days.
+    # Scanning backward from h_date, each step to a larger delta is an earlier date.
+    # current_run_start is updated on every elevated step so it always holds the
+    # farthest-back (earliest) point reached in the current run.
+    run_ramp_start = h_date  # default: no useful detection
+    best_run_start = None
+    current_run_start = None
+    current_run_length = 0
 
     for delta in range(0, holiday_window + 1):
+        t = h_date - datetime.timedelta(days=delta)
         offset = -delta
-        r = day_to_residual.get(offset, 0.0)
+        if offset not in day_to_residual:
+            # Break any current run
+            if current_run_length >= run_required:
+                if best_run_start is None or current_run_start < best_run_start:
+                    best_run_start = current_run_start
+            current_run_length = 0
+            current_run_start = None
+            continue
+
+        r = day_to_residual[offset]
         if abs(r) > run_threshold:
-            if consecutive == 0:
-                run_start_candidate = h_date - datetime.timedelta(days=delta)
-            consecutive += 1
-            if consecutive >= run_required:
-                run_ramp_start = run_start_candidate
+            current_run_length += 1
+            # Each step backward is an earlier date — always update run start
+            current_run_start = t
         else:
-            consecutive = 0
-            run_start_candidate = h_date
+            # End of run
+            if current_run_length >= run_required:
+                if best_run_start is None or current_run_start < best_run_start:
+                    best_run_start = current_run_start
+            current_run_length = 0
+            current_run_start = None
+
+    # Handle run still active at end of search window
+    if current_run_length >= run_required:
+        if best_run_start is None or current_run_start < best_run_start:
+            best_run_start = current_run_start
+
+    if best_run_start is not None:
+        run_ramp_start = best_run_start
 
     # Use whichever criterion gives the earlier (farther back) ramp_start
     if run_ramp_start < cusum_ramp_start:
@@ -439,6 +462,19 @@ def _build_holiday_effects(
             slope = 0.0
         name_drift[name] = slope
 
+    # Pre-divide compound block effect_series by the number of members so that
+    # summing all HolidayEffect.effect_series in holiday_component() sums to
+    # exactly the block's total effect — no double-counting.
+    block_shared_effect: Dict[int, pd.Series] = {}
+    for block in merged_effects:
+        n_members = len(block["merged_from"])
+        if n_members > 1:
+            # block["effect_series"] is the sum of all constituent effects over
+            # the merged window.  Divide once here and reuse for every member.
+            block_shared_effect[id(block)] = (
+                block["effect_series"].reindex(idx, fill_value=0.0) / n_members
+            )
+
     # Build one HolidayEffect per occurrence
     for name, occ_list in occurrence_data.items():
         if not occ_list:
@@ -466,11 +502,6 @@ def _build_holiday_effects(
                 compound_block_id = block_to_id[id(block)]
 
             # Ramp bounds: use block-level if merged, otherwise occurrence-level.
-            # NOTE: effect_series always uses the per-occurrence (pre-merge) effect so
-            # that summing all HolidayEffect.effect_series in fit_holidays does NOT
-            # double-count compound blocks.  The merged block's effect_series is the
-            # arithmetic sum of its constituent occurrence effects, so using individual
-            # effects preserves exact removal.
             if block is not None:
                 rs = block["ramp_start"]
                 re = block["ramp_end"]
@@ -479,8 +510,15 @@ def _build_holiday_effects(
                 rs = occ["ramp_start"]
                 re = occ["ramp_end"]
                 mag = occ["magnitude"]
-            # Always use the individual occurrence effect to avoid double-counting
-            effect_series = occ["effect_series"].reindex(idx, fill_value=0.0)
+
+            # effect_series for compound blocks: each member carries
+            # block_effect / n_members so that summing all members yields the
+            # block total exactly (no double-counting).
+            # For non-compound occurrences, use the individual occurrence effect.
+            if is_compound and block is not None:
+                effect_series = block_shared_effect[id(block)]
+            else:
+                effect_series = occ["effect_series"].reindex(idx, fill_value=0.0)
 
             # individual_peak_magnitude: mean residual in ±3 days around h_date
             # (uses occurrence-level effect_series before merge)

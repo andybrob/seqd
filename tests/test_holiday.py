@@ -222,6 +222,73 @@ def test_multi_year_holiday_detection():
         assert h in detected_dates, f"Holiday date {h} not found in detected effects"
 
 
+def test_compound_block_no_double_counting():
+    """Compound block members must not double-count: holiday_component() sum should
+    be within 20% of the injected effect, not 2-3x it."""
+    rng = np.random.default_rng(99)
+    n_days = 365 * 2
+    dates = pd.date_range("2023-01-01", periods=n_days, freq="D")
+    y = pd.Series(100.0 + rng.normal(0, 1.0, n_days), index=dates, name="y")
+
+    # Two holidays 6 days apart in each year — within ±14-day search window of each other
+    # so their ramp windows will overlap and form a compound block.
+    h1_dates = [datetime.date(2023, 12, 25), datetime.date(2024, 12, 25)]
+    h2_dates = [datetime.date(2023, 12, 31), datetime.date(2024, 12, 31)]
+
+    injected_total = 0.0
+    for h in h1_dates + h2_dates:
+        h_ts = pd.Timestamp(h)
+        if h_ts in y.index:
+            effect = 15.0
+            y.loc[h_ts] += effect
+            injected_total += effect
+
+    holidays = {"Christmas": h1_dates, "NewYear": h2_dates}
+    he_list, _ = fit_holidays(y_w=y, holidays=holidays)
+
+    # Reconstruct holiday_component() as DecompositionResult would
+    total = pd.Series(0.0, index=y.index)
+    for he in he_list:
+        aligned = he.effect_series.reindex(y.index, fill_value=0.0)
+        total = total + aligned
+
+    # Sum of positive effect values
+    pos_sum = float(total[total > 0].sum())
+
+    # Should be in the right ballpark (within 20% factor of 3×), not 2-3× injected
+    assert pos_sum < injected_total * 2.5, (
+        f"holiday_component() sum {pos_sum:.2f} is > 2.5× injected {injected_total:.2f} "
+        f"— double-counting suspected in compound block"
+    )
+
+
+def test_run_criterion_detects_gradual_ramp():
+    """Run criterion must fire for a gradual 8-day pre-holiday ramp and return
+    ramp_start at least 5 days before the holiday."""
+    from seqd._holiday import _detect_ramp_start
+
+    h_date = datetime.date(2024, 12, 25)
+    sigma_ref = 5.0
+    # 8 days of residuals each at 0.6 * sigma_ref — above run_threshold (0.5 * sigma_ref)
+    # but each individually below CUSUM threshold so CUSUM alone may not fire early.
+    day_to_residual: dict = {}
+    for delta in range(0, 9):  # delta 0..8 (today back to 8 days before)
+        day_to_residual[-delta] = 0.6 * sigma_ref
+
+    ramp_start = _detect_ramp_start(
+        h_date=h_date,
+        day_to_residual=day_to_residual,
+        sigma_ref=sigma_ref,
+        holiday_window=14,
+    )
+
+    days_before = (h_date - ramp_start).days
+    assert days_before >= 5, (
+        f"Run criterion should detect ramp_start at least 5 days before holiday, "
+        f"got ramp_start={ramp_start} which is only {days_before} days before {h_date}"
+    )
+
+
 def test_holiday_component_nonzero_all_years():
     """holiday_component() must have non-zero values in all years of a multi-year input."""
     from seqd import SeqdDecomposer

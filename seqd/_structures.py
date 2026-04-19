@@ -115,7 +115,7 @@ class DecompositionResult:
     weekly : WeeklyEffect
         Stage 1 weekly effect.
     holidays : list of HolidayEffect
-        Stage 2 holiday effects (one per unique holiday, aggregating all years).
+        Stage 2 holiday effects (one per occurrence (year) per holiday name).
     annual : AnnualEffect
         Stage 3 annual effect.
     residual : pd.Series
