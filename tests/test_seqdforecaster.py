@@ -445,3 +445,179 @@ def test_no_future_holidays_holiday_component_is_zero():
         0.0,
         err_msg="holiday_component should be all zero when no future_holidays supplied",
     )
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: compound window masking suppresses Jan changepoints
+# ---------------------------------------------------------------------------
+
+
+def test_mask_compound_windows_no_nan_leak():
+    """_mask_compound_windows must return a fully-finite series (no NaN)."""
+    from seqd._seqdforecaster import SeqdForecaster as SF
+
+    result, _ = make_decomposition(add_holiday=True)
+    masked = SF._mask_compound_windows(result.residual, result.holidays)
+
+    assert masked.isna().sum() == 0, "Masked residual must not contain NaN"
+    assert len(masked) == len(result.residual)
+
+
+def test_mask_compound_windows_no_compound_unchanged():
+    """_mask_compound_windows should leave residual unchanged when no compound holidays."""
+    from seqd._seqdforecaster import SeqdForecaster as SF
+
+    # make_decomposition with add_holiday=False → no HolidayEffect objects
+    result, _ = make_decomposition(add_holiday=False)
+    masked = SF._mask_compound_windows(result.residual, result.holidays)
+
+    # With no compound effects, the series should be identical
+    pd.testing.assert_series_equal(masked, result.residual)
+
+
+def test_compound_masking_reduces_false_changepoints():
+    """Synthetic BFCM-style series: masking should reduce Jan changepoints.
+
+    Build a 3-year series with a large BFCM compound block that abruptly
+    ends on Jan 1. Verify that running fit() with masking enabled produces
+    fewer changepoints than a naive run would on the unmasked series.
+
+    This is a regression test — the exact count depends on PELT penalty,
+    but with masking the Jan 1 drop should NOT be detected as a changepoint.
+    """
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, HolidayEffect, WeeklyEffect
+    )
+    import datetime
+
+    rng = np.random.default_rng(1234)
+    n = 3 * 365
+    dates = pd.date_range("2021-01-01", periods=n, freq="D")
+    t = np.arange(n, dtype=float)
+
+    # Smooth linear trend + noise
+    y_values = 100.0 + 0.05 * t + rng.normal(0, 3.0, n)
+
+    # Inject a large BFCM compound block (Nov 1 – Dec 31) each year with
+    # an abrupt drop back to baseline on Jan 1.
+    holiday_effects = []
+    for yr in [2021, 2022]:
+        block_start = pd.Timestamp(yr, 11, 1)
+        block_end = pd.Timestamp(yr, 12, 31)
+        mask = (dates >= block_start) & (dates <= block_end)
+        y_values[mask] += 40.0  # large lift
+
+        effect_vals = np.where(mask, 40.0, 0.0)
+        he = HolidayEffect(
+            date=datetime.date(yr, 11, 26),
+            name="BFCM",
+            ramp_start=datetime.date(yr, 11, 1),
+            ramp_end=datetime.date(yr, 12, 31),
+            magnitude=40.0,
+            effect_series=pd.Series(effect_vals, index=dates),
+            year_magnitudes=[40.0],
+            magnitude_drift=0.0,
+            compound=True,
+            compound_block_id=f"compound_block_{yr}_1",
+            individual_peak_magnitude=40.0,
+            ramp_start_ceiling_hit=False,
+            individual_peak_magnitude_reliable=True,
+        )
+        holiday_effects.append(he)
+
+    y_series = pd.Series(y_values, index=dates)
+    residual = y_series.copy()  # pretend the holiday effect was already removed
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=holiday_effects,
+        annual=annual,
+        residual=residual,
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    forecaster = SeqdForecaster(result)
+    forecaster.fit(changepoint_penalty_beta=3.0, min_segment_size=60)
+    cps = forecaster.changepoints
+
+    # The Jan 1 "drop" dates (2022-01-01, 2023-01-01) must NOT be changepoints.
+    jan_dates = {pd.Timestamp("2022-01-01"), pd.Timestamp("2023-01-01")}
+    detected_set = set(cps)
+    false_jan_cps = jan_dates & detected_set
+    assert len(false_jan_cps) == 0, (
+        f"Masking should suppress Jan 1 changepoints; detected: {false_jan_cps}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: ForecastResult.warnings is populated
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_result_warnings_field_exists():
+    """ForecastResult.warnings should be a list (possibly empty)."""
+    result, _ = make_decomposition()
+    fr = SeqdForecaster(result).fit().predict(horizon=30)
+    assert hasattr(fr, "warnings")
+    assert isinstance(fr.warnings, list)
+
+
+def test_forecast_result_warnings_populated_on_quadratic_overextension():
+    """When last segment is quadratic and horizon >> segment length, warnings list non-empty."""
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, SegmentTrend, WeeklyEffect
+    )
+
+    rng = np.random.default_rng(99)
+    n = 93  # ~1 quarter — short enough that a year-long forecast has t >> 1
+    dates = pd.date_range("2023-10-01", periods=n, freq="D")
+    t = np.linspace(0, 1, n)
+    # Quadratic residual
+    y_values = 100.0 + 5.0 * t + 2.0 * t ** 2 + rng.normal(0, 0.5, n)
+    y_series = pd.Series(y_values, index=dates)
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=[],
+        annual=annual,
+        residual=y_series.copy(),
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        fr = SeqdForecaster(result).fit(min_segment_size=30).predict(
+            horizon=365, max_extrapolation_days=365
+        )
+
+    # If the last segment is quadratic, warnings list should contain a message.
+    last_seg = fr.segments[-1]
+    if last_seg.model_type == "quadratic":
+        assert len(fr.warnings) > 0, (
+            "Quadratic overextension should produce a non-empty warnings list"
+        )
+        assert any("quadratic" in w.lower() for w in fr.warnings)

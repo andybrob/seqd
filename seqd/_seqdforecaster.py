@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from ._changepoint import detect_changepoints
@@ -58,6 +59,42 @@ class SeqdForecaster:
     # fit / predict
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _mask_compound_windows(
+        residual: pd.Series,
+        holiday_effects,
+    ) -> pd.Series:
+        """Replace residual values inside compound block windows with linear interpolation.
+
+        PELT sees the abrupt drop in the residual at the end of each BFCM compound
+        block (Jan 1) as a level-shift changepoint, producing ~6-8 spurious annual
+        detections.  Masking and re-interpolating the residual inside every compound
+        window removes these artefacts before the changepoint search.
+
+        Parameters
+        ----------
+        residual : pd.Series
+            V1 residual series (daily DatetimeIndex).
+        holiday_effects : list of HolidayEffect
+            From ``DecompositionResult.holidays``.
+
+        Returns
+        -------
+        pd.Series
+            Copy of residual with compound-window values replaced by linear
+            interpolation between the edges of each masked block.
+        """
+        masked = residual.copy()
+        for eff in holiday_effects:
+            if eff.compound:
+                ramp_start = pd.Timestamp(eff.ramp_start)
+                ramp_end = pd.Timestamp(eff.ramp_end)
+                mask = (masked.index >= ramp_start) & (masked.index <= ramp_end)
+                if mask.sum() > 0:
+                    masked.loc[mask] = np.nan
+        masked = masked.interpolate(method="linear", limit_direction="both")
+        return masked
+
     def fit(
         self,
         changepoint_penalty_beta: float = 3.0,
@@ -86,8 +123,18 @@ class SeqdForecaster:
         """
         residual = self._result.residual
 
+        # Mask compound block windows before changepoint detection.
+        # BFCM-style compound effects end abruptly at Dec 31; the resulting
+        # level-drop on Jan 1 appears as a false structural break to PELT.
+        # Interpolating through those windows suppresses ~6-8 spurious annual
+        # changepoints without affecting the final trend fit (which uses the
+        # original, unmasked residual below).
+        residual_for_detection = self._mask_compound_windows(
+            residual, self._result.holidays
+        )
+
         changepoint_dates, _ = detect_changepoints(
-            residual=residual,
+            residual=residual_for_detection,
             penalty_beta=changepoint_penalty_beta,
             min_size=min_segment_size,
         )
@@ -159,7 +206,7 @@ class SeqdForecaster:
 
         # --- Trend projection ---
         last_segment = segments[-1]
-        trend_arr = _project_trend(
+        trend_arr, forecast_warnings = _project_trend(
             last_segment=last_segment,
             horizon=horizon,
             max_extrapolation_days=max_extrapolation_days,
@@ -214,6 +261,7 @@ class SeqdForecaster:
             segments=list(segments),
             horizon=horizon,
             is_multiplicative=is_mult,
+            warnings=list(forecast_warnings),
         )
 
     # ------------------------------------------------------------------

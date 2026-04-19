@@ -23,7 +23,7 @@ def _project_trend(
     last_segment: SegmentTrend,
     horizon: int,
     max_extrapolation_days: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, List[str]]:
     """Project the last segment's trend forward for ``horizon`` days.
 
     The normalised time coordinate is extended beyond the in-sample range:
@@ -41,8 +41,11 @@ def _project_trend(
 
     Returns
     -------
-    np.ndarray
+    trend_array : np.ndarray
         Shape ``(horizon,)``.
+    emitted_warnings : list of str
+        Warning messages emitted during this call (also raised via
+        ``warnings.warn``).
     """
     n_j = last_segment.n_obs
     emitted_warnings: List[str] = []
@@ -59,9 +62,10 @@ def _project_trend(
         msg = (
             "Last segment model is 'exp' with positive beta and horizon "
             f"({horizon}) > segment length ({n_j}). "
-            "Exponential extrapolation grows without bound."
+            "Exponential extrapolation clamped to linear continuation at t=1."
         )
         warnings.warn(msg, UserWarning, stacklevel=4)
+        emitted_warnings.append(msg)
 
     if last_segment.model_type == "quadratic":
         # t_H = (n_j - 1 + horizon) / (n_j - 1)
@@ -73,18 +77,54 @@ def _project_trend(
             msg = (
                 "Last segment model is 'quadratic' and forecast extends "
                 f"t={t_H:.2f} > 2 (horizon={horizon} > segment length={n_j}). "
-                "Quadratic extrapolation may accelerate strongly."
+                "Quadratic extrapolation clamped to linear continuation at t=1."
             )
             warnings.warn(msg, UserWarning, stacklevel=4)
+            emitted_warnings.append(msg)
 
     # Edge case: single-observation last segment → constant extrapolation
     if n_j <= 1:
-        return np.full(horizon, last_segment.alpha)
+        return np.full(horizon, last_segment.alpha), emitted_warnings
 
     # t_h = ((n_j - 1) + h) / (n_j - 1) for h = 1..horizon
     denom = float(n_j - 1)
-    t_values = [(denom + h) / denom for h in range(1, horizon + 1)]
-    return np.array([evaluate_segment(last_segment, t) for t in t_values])
+    t_values = np.array([(denom + h) / denom for h in range(1, horizon + 1)])
+
+    model = last_segment.model_type
+
+    if model == "quadratic":
+        # For t > 1 (extrapolation beyond segment end), switch to linear
+        # continuation using the slope at t=1. This prevents the quadratic
+        # term from dominating and producing explosive growth (e.g. t=4.92
+        # in a 93-day Q4 segment → catastrophic overforecast).
+        alpha = last_segment.alpha
+        beta = last_segment.beta
+        gamma = last_segment.gamma if last_segment.gamma is not None else 0.0
+        f_at_end = alpha + beta + gamma          # f(t=1)
+        slope_at_end = beta + 2.0 * gamma        # df/dt at t=1
+        result = np.where(
+            t_values <= 1.0,
+            alpha + beta * t_values + gamma * t_values ** 2,
+            f_at_end + slope_at_end * (t_values - 1.0),
+        )
+        return result, emitted_warnings
+
+    if model == "exp":
+        # For t > 1 with positive beta, exponential grows without bound.
+        # Switch to linear continuation from t=1 using the instantaneous
+        # slope there: df/dt = alpha * beta * exp(beta * t).
+        alpha = last_segment.alpha
+        beta = last_segment.beta
+        f_at_end = alpha * np.exp(beta)                  # f(t=1)
+        slope_at_end = alpha * beta * np.exp(beta)        # df/dt at t=1
+        result = np.where(
+            t_values <= 1.0,
+            alpha * np.exp(beta * t_values),
+            f_at_end + slope_at_end * (t_values - 1.0),
+        )
+        return result, emitted_warnings
+
+    return np.array([evaluate_segment(last_segment, t) for t in t_values]), emitted_warnings
 
 
 # ---------------------------------------------------------------------------

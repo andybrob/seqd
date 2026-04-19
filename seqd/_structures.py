@@ -86,9 +86,16 @@ class ForecastResult:
     trend_component : pd.Series
         Piecewise trend extrapolation; same index as ``forecast``.
     weekly_component : pd.Series
-        DOW effects used in the forecast.  In multiplicative mode these are
-        the raw unit-mean factors ``w_d``; in additive mode they are the
-        zero-sum offsets.  Same index as ``forecast``.
+        DOW multiplier factors (or offsets) used in the forecast.
+        **These are NOT dollar contributions.**
+        In multiplicative mode the values are the raw unit-mean DOW factors
+        ``w_d`` (e.g. 1.07 for Monday, 0.95 for Saturday).  The total
+        forecast is ``w_d × (trend + annual + holiday)``, so the dollar
+        contribution of the weekly effect is
+        ``(w_d - 1) × (trend + annual + holiday)``.
+        In additive mode the values are zero-sum DOW offsets (e.g. +3.0 on
+        Monday, -5.0 on Sunday) and are added directly to the other
+        components.  Same index as ``forecast``.
     annual_component : pd.Series
         Fourier annual projection (intercept excluded); same index.
     holiday_component : pd.Series

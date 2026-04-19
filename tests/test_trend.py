@@ -13,6 +13,7 @@ from seqd._trend import (
     fit_segment,
 )
 from seqd._structures import SegmentTrend
+from seqd._forecast import _project_trend
 
 
 def make_segment_trend(
@@ -290,3 +291,105 @@ def test_fit_piecewise_linear_parsimony():
     y = make_series(r)
     segs = fit_piecewise_trend(y, changepoint_dates=[], aic_linear_delta=2.0)
     assert segs[0].model_type == "linear"
+
+
+# ---------------------------------------------------------------------------
+# Linear continuation for quadratic extrapolation (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+def test_quadratic_extrapolation_linear_continuation():
+    """_project_trend with quadratic model should use linear continuation for t > 1.
+
+    The continuation must be C0-smooth (no jump at t=1) and must NOT
+    reproduce the pure quadratic value at t > 1.
+    """
+    # Build a quadratic segment: alpha=10, beta=5, gamma=2
+    # f(t) = 10 + 5t + 2t^2
+    # f(1) = 17, slope at t=1 = 5 + 4 = 9
+    seg = make_segment_trend("quadratic", alpha=10.0, beta=5.0, gamma=2.0, n_obs=100)
+
+    # Project with a long horizon so t >> 1
+    horizon = 200  # t_max = (99 + 200) / 99 ≈ 3.02
+    arr, warns = _project_trend(seg, horizon=horizon, max_extrapolation_days=365)
+    assert len(arr) == horizon
+
+    # At t=1 (h=1): still within segment end, should match quadratic
+    # t at h=1 is (99 + 1)/99 = 100/99 ≈ 1.0101 — just past the boundary,
+    # linear continuation applies: f(1) + 9*(t-1)
+    f_at_end = 10.0 + 5.0 + 2.0  # = 17
+    slope_at_end = 5.0 + 4.0     # = 9
+
+    for i, h in enumerate(range(1, horizon + 1)):
+        t_i = (99 + h) / 99.0
+        if t_i > 1.0:
+            expected = f_at_end + slope_at_end * (t_i - 1.0)
+            assert abs(arr[i] - expected) < 1e-8, (
+                f"h={h}, t={t_i:.4f}: expected linear {expected:.4f}, got {arr[i]:.4f}"
+            )
+        else:
+            expected_quad = 10.0 + 5.0 * t_i + 2.0 * t_i ** 2
+            assert abs(arr[i] - expected_quad) < 1e-8
+
+
+def test_quadratic_extrapolation_does_not_explode():
+    """Quadratic extrapolation capped at t=1 should produce bounded, reasonable values."""
+    # Use parameters that would explode quadratically: gamma=100 (large)
+    seg = make_segment_trend("quadratic", alpha=100.0, beta=5.0, gamma=100.0, n_obs=93)
+    # t at end of 365-day forecast: (92 + 365) / 92 ≈ 4.97
+    arr, _ = _project_trend(seg, horizon=365, max_extrapolation_days=365)
+
+    # Without the fix, arr[-1] would be ~100 + 5*4.97 + 100*4.97^2 ≈ 2594.
+    # With the fix (linear continuation from t=1): f(1) = 205, slope = 205
+    # so arr[-1] ≈ 205 + 205 * (4.97 - 1) ≈ 205 + 814 ≈ 1019.
+    # The key assertion: it must be less than the uncapped quadratic would give.
+    f_at_end = 100.0 + 5.0 + 100.0   # = 205
+    slope_at_end = 5.0 + 200.0        # = 205
+    t_last = (92 + 365) / 92.0
+    expected_last = f_at_end + slope_at_end * (t_last - 1.0)
+    uncapped_last = 100.0 + 5.0 * t_last + 100.0 * t_last ** 2
+
+    assert abs(arr[-1] - expected_last) < 1e-6
+    assert arr[-1] < uncapped_last, "Capped value should be less than uncapped quadratic"
+
+
+def test_exp_extrapolation_linear_continuation():
+    """_project_trend with exp model caps to linear continuation for t > 1."""
+    # alpha=10, beta=0.5 → f(1) = 10*exp(0.5), slope at 1 = 10*0.5*exp(0.5)
+    seg = make_segment_trend("exp", alpha=10.0, beta=0.5, n_obs=100)
+
+    horizon = 200
+    arr, _ = _project_trend(seg, horizon=horizon, max_extrapolation_days=365)
+
+    f_at_end = 10.0 * np.exp(0.5)
+    slope_at_end = 10.0 * 0.5 * np.exp(0.5)
+
+    for i, h in enumerate(range(1, horizon + 1)):
+        t_i = (99 + h) / 99.0
+        if t_i > 1.0:
+            expected = f_at_end + slope_at_end * (t_i - 1.0)
+            assert abs(arr[i] - expected) < 1e-8, (
+                f"h={h}, t={t_i:.4f}: expected {expected:.4f}, got {arr[i]:.4f}"
+            )
+
+
+def test_project_trend_returns_warnings_list():
+    """_project_trend must return a (array, list) tuple."""
+    seg = make_segment_trend("linear", alpha=1.0, beta=0.5, n_obs=100)
+    result = _project_trend(seg, horizon=30, max_extrapolation_days=365)
+    assert isinstance(result, tuple)
+    arr, warns = result
+    assert isinstance(arr, np.ndarray)
+    assert isinstance(warns, list)
+
+
+def test_project_trend_quadratic_warning_collected():
+    """Quadratic extrapolation warning should appear in returned warnings list."""
+    import warnings as _warnings
+    seg = make_segment_trend("quadratic", alpha=10.0, beta=5.0, gamma=2.0, n_obs=93)
+    with _warnings.catch_warnings(record=True):
+        _warnings.simplefilter("always")
+        _, warns = _project_trend(seg, horizon=365, max_extrapolation_days=365)
+    assert any("quadratic" in w.lower() for w in warns), (
+        f"Expected quadratic warning in {warns}"
+    )
