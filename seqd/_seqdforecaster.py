@@ -244,12 +244,23 @@ class SeqdForecaster:
             final_seg_start = pd.Timestamp(final_seg.start_date)
             final_seg_end = pd.Timestamp(final_seg.end_date)
 
-            # Find the latest compound block that overlaps the final segment
+            # Find the latest compound block that overlaps the final segment.
+            # GUARD: only apply carveout when the series end falls INSIDE the
+            # compound block window (i.e. the block is still "in flight" at
+            # the training cutoff).  When the series ends AFTER the block_end,
+            # the post-BFCM recovery data is already captured in the final
+            # segment's OLS fit, so no carveout is needed.  Applying the
+            # carveout to a fully-settled block would truncate the segment to
+            # the tiny pre-block stub, producing a wildly over-fitted slope.
             carveout_cutoff: Optional[pd.Timestamp] = None
+            series_end = final_seg_end
             for eff in self._result.holidays:
                 if eff.compound:
                     block_start = pd.Timestamp(eff.ramp_start)
                     block_end = pd.Timestamp(eff.ramp_end)
+                    # Only apply carveout if the block is unfinished at series end
+                    if series_end > block_end:
+                        continue  # block already settled — no carveout needed
                     # Check overlap with final segment
                     overlap_start = max(final_seg_start, block_start)
                     overlap_end = min(final_seg_end, block_end)
