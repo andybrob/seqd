@@ -15,8 +15,9 @@
 7. [Recency Diagnostics Framework](#7-recency-diagnostics-framework)
 8. [R² Decomposition](#8-r-decomposition)
 9. [API Reference](#9-api-reference)
-10. [Known Limitations](#10-known-limitations)
-11. [Quick Start Example](#11-quick-start-example)
+10. [Recommended Configurations](#10-recommended-configurations)
+11. [Known Limitations](#11-known-limitations)
+12. [Quick Start Example](#12-quick-start-example)
 
 ---
 
@@ -329,7 +330,7 @@ $$\tilde{y}_t^{(h)} = y_t^{(h)} - \hat{\alpha}_{dt} - \hat{\beta}_{dt}\,t$$
 
 where $[\hat{\alpha}_{dt}, \hat{\beta}_{dt}]$ are OLS estimates from regressing $y_t^{(h)}$ on $[1, t]$.  This detrended series is used for **both BIC selection and the final coefficient estimation** (see Section 6.3).
 
-BIC is evaluated over $K \in \{0, 1, 2, 3, 4, 5, 6\}$:
+BIC is evaluated over $K \in \{0, 1, \ldots, \texttt{max\_harmonics}\}$ (default range $\{0, 1, 2, 3, 4, 5, 6\}$):
 
 $$\operatorname{BIC}(K) = n \log\!\left(\frac{\operatorname{RSS}(K)}{n}\right) + (2K+1)\log(n)$$
 
@@ -428,6 +429,7 @@ SeqdDecomposer(
 | `holiday_window` | `int` | `14` | Half-width $W$ of the holiday search window in days. Controls how far before and after the holiday date the ramp detection and ramp-end scan extend. Recommendation: use 35 or more for extended retail events such as Black Friday / Cyber Monday. |
 | `max_holiday_window` | `int` or `None` | `None` | When set, overrides `holiday_window` as the effective search window passed to the holiday stage. Useful when `holiday_window` is set to a conservative default but a specific run requires a wider window without changing the base parameter. When `None`, `holiday_window` is used as-is. |
 | `reference_window` | `int` | `60` | Length $R$ of the pre/post-holiday baseline window in days. A warning is issued when `len(y) < 2 * reference_window`. |
+| `max_harmonics` | `int` | `6` | Upper bound on BIC harmonic search: $K \in \{0, 1, \ldots, \texttt{max\_harmonics}\}$. **Recommendation: for series with 3 or more years of daily data, setting `max_harmonics=8` may capture finer within-year structure** (e.g. distinct spring and autumn shoulders) that K=6 cannot represent. Must be >= 0. |
 
 **`fit(y)`**
 
@@ -491,14 +493,61 @@ Returns `DecompositionResult`.  Raises `ValueError` on constraint violations; is
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `n_harmonics` | `int` | BIC-selected harmonic count $\hat{K} \in \{0,1,2,3,4,5,6\}$. Zero means no annual seasonality was detected. |
+| `n_harmonics` | `int` | BIC-selected harmonic count $\hat{K} \in \{0,1,\ldots,\texttt{max\_harmonics}\}$ (default range 0–6). Zero means no annual seasonality was detected. |
 | `coefficients` | `np.ndarray` | Fourier coefficients $[\hat{a}_0, \hat{a}_1, \hat{b}_1, \ldots, \hat{a}_{\hat{K}}, \hat{b}_{\hat{K}}]$. Length $2\hat{K}+1$; fit on the original (non-detrended) $y_t^{(h)}$. |
 | `component` | `pd.Series` | The annual component $\hat{S}(t)$ aligned to original index (intercept excluded). |
 | `recency_amplitudes` | `dict[int, float]` | Keys 1, 2, 3 (trailing years). Values: $\sqrt{\hat{a}_1'^2 + \hat{b}_1'^2}$ from a $K=1$ fit on the linearly detrended sub-series. `NaN` if the window is shorter than 30 days. |
 
 ---
 
-## 10. Known Limitations
+## 10. Recommended Configurations
+
+### 10.1 Retail / E-commerce with 3+ Years of Daily Data
+
+```python
+result = SeqdDecomposer(
+    holiday_dates=holidays,
+    holiday_window=50,           # wide window for BFCM buildups
+    reference_window=60,
+    max_holiday_merge_gap_days=35,
+    max_harmonics=8,             # allow finer annual structure on long series
+).fit(y)
+```
+
+**Why `max_harmonics=8`?** With 3+ years of daily data the BIC has sufficient
+observations to distinguish genuine K=7 and K=8 harmonics from noise. These
+harmonics represent within-quarter patterns (~46-day period for K=8) that are common
+in e-commerce revenue: post-holiday lulls, back-to-school, and mid-summer peaks.
+Setting `max_harmonics` above 8 is not recommended (see Known Limitations below).
+
+### 10.2 Adaptive IPM for Recent Momentum
+
+Use `use_adaptive_ipm=True` when the business growth rate has shifted meaningfully in
+the past 1–2 years and you want the holiday magnitude projection to reflect that
+recency rather than fitting a uniform OLS slope over all historical years:
+
+```python
+forecaster = SeqdForecaster(
+    result,
+    slope_blend_alpha=0.5,
+    use_adaptive_ipm=True,       # overrides trend_yoy_blend=0.5, ipm_decay_halflife=1.5
+)
+forecaster.fit(
+    changepoint_penalty_beta=3.0,
+    min_segment_size=60,
+    aic_linear_delta=2.0,
+    enable_bfcm_carveout=True,
+)
+```
+
+The `use_adaptive_ipm` preset sets `trend_yoy_blend=0.5` (equal blend of OLS and
+trend-implied IPM projection) and `ipm_decay_halflife=1.5` (exponential half-life of
+1.5 years, giving the most recent holiday year ~50% more weight than the year two
+years ago). `slope_blend_alpha` and `ipm_max_years` are not overridden.
+
+---
+
+## 11. Known Limitations
 
 **CUSUM threshold is fixed.** The CUSUM threshold $2\hat{\sigma}_{ref}$ and run threshold $0.5\hat{\sigma}_{ref}$ are constants.  For series with heavy-tailed noise the false-positive rate for ramp detection may be elevated; for very smooth series the detector may be over-sensitive.  A data-adaptive threshold derived from the empirical null distribution of the CUSUM statistic would be more principled but is not implemented.
 
@@ -510,11 +559,11 @@ Returns `DecompositionResult`.  Raises `ValueError` on constraint violations; is
 
 **`holiday_window` default of 14 is too small for extended retail events.** Black Friday / Cyber Monday buildups in retail data routinely begin 3–4 weeks before the date; the post-event hangover can extend 5–7 days.  The default `holiday_window=14` will systematically underdetect the pre-event ramp (CUSUM cannot accumulate sufficient signal beyond 14 days) and will force `ramp_end = h + 14` when no recovery is found.  Values of 35 or greater are recommended for BFCM and similar multi-week promotional events.
 
-**BIC harmonic ceiling of $K = 6$.** The harmonic search is restricted to $K \in \{0,1,2,3,4,5,6\}$.  For most daily business series this ceiling is sufficient; very unusual annual shapes with fine sub-annual structure are the exception.  Residual annual structure visible in `result.residual` after Stage 3 is a signal that the series may require pre-processing or a domain-specific model rather than additional harmonics.  The ceiling is not currently a user-controllable parameter.
+**BIC harmonic ceiling.** The harmonic search ceiling is controlled by `max_harmonics` (default `6`), restricting $K \in \{0,1,\ldots,\texttt{max\_harmonics}\}$.  For most daily business series the default of 6 is sufficient.  **For series with 3 or more years of daily data**, users may set `max_harmonics=8` to allow the BIC to capture finer within-year structure (e.g. distinct spring and autumn shoulders, or sub-quarterly revenue patterns) that the K=6 ceiling cannot represent.  Setting `max_harmonics` above 8 is not recommended: beyond K=8, the Fourier basis becomes dense relative to the annual period (each harmonic covers ~45 days), risking over-fit and reduced out-of-sample accuracy.  Residual annual structure visible in `result.residual` after Stage 3 is a signal that the series may benefit from a higher ceiling or from external pre-processing.
 
 ---
 
-## 11. Quick Start Example
+## 12. Quick Start Example
 
 ```python
 import pandas as pd

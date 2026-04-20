@@ -86,7 +86,15 @@ class SeqdDecomposer:
     max_harmonics : int
         Upper bound on the number of Fourier harmonics considered during BIC
         selection for annual seasonality.  BIC searches K ∈ {0, ..., max_harmonics}.
-        Default 6.  Reducing this prevents over-fitting on short or sparse series.
+        Default 6.
+
+        **Recommendation:** for series with 3 or more years of daily data,
+        setting ``max_harmonics=8`` may capture finer within-year structure
+        (e.g. distinct spring and autumn shoulders, or sub-quarterly revenue
+        patterns) that the default K=6 ceiling cannot represent.  Values above
+        8 are not recommended: each harmonic above K=8 covers ~45 days or less,
+        making over-fit likely.
+
         Must be >= 0.
     """
 
