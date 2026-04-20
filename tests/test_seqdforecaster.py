@@ -1331,3 +1331,62 @@ def test_trend_yoy_blend_0_returns_ols():
         f"trend_yoy_blend=0.0 should equal pure OLS ({ols_only:.2f}), "
         f"got {projected_blend0:.2f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests for use_adaptive_ipm preset
+# ---------------------------------------------------------------------------
+
+def test_use_adaptive_ipm_overrides_defaults():
+    """use_adaptive_ipm=True should set trend_yoy_blend=0.5 and ipm_decay_halflife=1.5."""
+    from seqd._seqdforecaster import SeqdForecaster
+    import pandas as pd
+    import numpy as np
+    from seqd import SeqdDecomposer
+
+    n = 400
+    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+    rng = np.random.default_rng(1)
+    y = pd.Series(10000.0 + rng.normal(0, 100, n), index=dates)
+    result = SeqdDecomposer(holiday_dates={}).fit(y)
+
+    fc = SeqdForecaster(result, use_adaptive_ipm=True)
+    assert fc._trend_yoy_blend == SeqdForecaster._ADAPTIVE_IPM_TREND_YOY_BLEND
+    assert fc._ipm_decay_halflife == SeqdForecaster._ADAPTIVE_IPM_DECAY_HALFLIFE
+    assert fc._use_adaptive_ipm is True
+
+
+def test_use_adaptive_ipm_does_not_override_slope_blend():
+    """use_adaptive_ipm=True should NOT change slope_blend_alpha."""
+    from seqd._seqdforecaster import SeqdForecaster
+    import pandas as pd
+    import numpy as np
+    from seqd import SeqdDecomposer
+
+    n = 400
+    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+    rng = np.random.default_rng(2)
+    y = pd.Series(10000.0 + rng.normal(0, 100, n), index=dates)
+    result = SeqdDecomposer(holiday_dates={}).fit(y)
+
+    fc = SeqdForecaster(result, use_adaptive_ipm=True, slope_blend_alpha=0.3)
+    assert fc._slope_blend_alpha == 0.3  # not overridden
+
+
+def test_use_adaptive_ipm_false_default():
+    """use_adaptive_ipm=False (default) preserves passed parameter values."""
+    from seqd._seqdforecaster import SeqdForecaster
+    import pandas as pd
+    import numpy as np
+    from seqd import SeqdDecomposer
+
+    n = 400
+    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+    rng = np.random.default_rng(3)
+    y = pd.Series(10000.0 + rng.normal(0, 100, n), index=dates)
+    result = SeqdDecomposer(holiday_dates={}).fit(y)
+
+    fc = SeqdForecaster(result, trend_yoy_blend=0.7, ipm_decay_halflife=2.0)
+    assert fc._trend_yoy_blend == 0.7
+    assert fc._ipm_decay_halflife == 2.0
+    assert fc._use_adaptive_ipm is False
