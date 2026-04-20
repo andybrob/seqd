@@ -878,3 +878,116 @@ def test_slope_at_t1_per_day_constant():
         t_anchor_date=pd.Timestamp("2022-01-01"),
     )
     assert _slope_at_t1_per_day(seg) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# IPM-based compound block holiday projection
+# ---------------------------------------------------------------------------
+
+
+def test_compound_block_ipm_projection_peak_on_holiday_date():
+    """Compound block holiday: projected IPM should appear on the holiday date.
+
+    Build a synthetic DecompositionResult with two compound block holiday
+    occurrences (e.g., two years of Black Friday in the same block).  The
+    projected IPM should be placed on the future holiday date (within a small
+    tolerance), not smeared across a flat block effect.
+
+    This is the regression test for the root-cause fix: before the fix,
+    _project_holidays projected the block-level mean effect_series (~$80M flat)
+    rather than the per-holiday IPM ($584M on Black Friday).
+    """
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, HolidayEffect, WeeklyEffect,
+    )
+    from seqd._forecast import _project_holidays
+    import datetime
+
+    # Build a 3-year series so the forecaster has enough data
+    rng = np.random.default_rng(42)
+    n = 3 * 365
+    dates = pd.date_range("2021-01-01", periods=n, freq="D")
+    t = np.arange(n, dtype=float)
+    y_values = 100.0 + 0.05 * t + rng.normal(0, 2.0, n)
+    y_series = pd.Series(y_values, index=dates)
+
+    # Construct two historical Black Friday occurrences in the same compound block.
+    # ipm_2021 = 200, ipm_2022 = 300 → OLS projects ipm_2023 ≈ 400.
+    block_id = "compound_block_bfcm_1"
+
+    def make_bfcm_he(yr, ipm_val):
+        bf_date = datetime.date(yr, 11, 26)
+        rs = datetime.date(yr, 11, 1)
+        re = datetime.date(yr, 12, 15)
+        # Non-primary compound members carry zero effect_series
+        eff = pd.Series(0.0, index=dates)
+        return HolidayEffect(
+            date=bf_date,
+            name="Black Friday",
+            ramp_start=rs,
+            ramp_end=re,
+            magnitude=50.0,  # block-level mean — intentionally low
+            effect_series=eff,
+            year_magnitudes=[50.0],
+            magnitude_drift=0.0,
+            compound=True,
+            compound_block_id=block_id,
+            individual_peak_magnitude=ipm_val,
+            ramp_start_ceiling_hit=False,
+            individual_peak_magnitude_reliable=True,
+        )
+
+    he_2021 = make_bfcm_he(2021, 200.0)
+    he_2022 = make_bfcm_he(2022, 300.0)
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=[he_2021, he_2022],
+        annual=annual,
+        residual=y_series.copy(),
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    # Future holiday: Black Friday 2023
+    bf_2023 = pd.Timestamp("2023-11-24")
+    forecast_dates = pd.date_range("2023-10-01", periods=120, freq="D")
+
+    holiday_arr = _project_holidays(
+        result=result,
+        forecast_dates=forecast_dates,
+        future_holidays={"Black Friday": [bf_2023]},
+    )
+
+    # The projected IPM from OLS: ipm_pairs = [(0, 200), (1, 300)] → slope=100,
+    # projected = 300 + 100 = 400. At the holiday date itself, weight = 1.0 (day_delta=0).
+    # So holiday_arr at bf_2023 date should equal 400.0 ± 1.0.
+    bf_idx = forecast_dates.get_loc(bf_2023)
+    peak_value = holiday_arr[bf_idx]
+
+    assert abs(peak_value - 400.0) < 1.0, (
+        f"Expected peak IPM ≈ 400.0 on Black Friday 2023, got {peak_value:.2f}. "
+        "IPM-based compound block projection is not working correctly."
+    )
+
+    # Also verify that the peak is ON the holiday date (not a neighbour day)
+    fc_series = pd.Series(holiday_arr, index=forecast_dates)
+    # Restrict to ±3 days around bf_2023
+    window_start = bf_2023 - pd.Timedelta(days=3)
+    window_end = bf_2023 + pd.Timedelta(days=3)
+    window = fc_series.loc[window_start:window_end]
+    peak_date = window.idxmax()
+    assert peak_date == bf_2023, (
+        f"Peak holiday effect should be on {bf_2023.date()}, but was on {peak_date.date()}."
+    )
