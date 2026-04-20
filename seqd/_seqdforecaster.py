@@ -36,14 +36,29 @@ class SeqdForecaster:
 
         ``blended_slope = alpha * slope_penultimate + (1 - alpha) * slope_final``
 
-        At ``alpha=0.0`` (default) no blending occurs and the final segment's
-        own slope drives extrapolation (legacy behaviour).  At ``alpha=1.0``
-        the penultimate slope is used entirely.  Recommended value: ``0.3``
-        to suppress Q4-contaminated final segment slopes while retaining
-        most of the recent trend signal.
+        Default ``0.5`` — equal weight on the penultimate and final segment
+        slopes.  This is structurally motivated: the final segment often ends
+        in Q4 (seasonal acceleration), making its slope steeper than the
+        underlying structural growth rate.  Giving equal weight to the
+        penultimate slope is more conservative and less likely to over-
+        extrapolate.  At ``alpha=0.0`` no blending occurs (final-segment-only,
+        legacy behaviour).  At ``alpha=1.0`` the penultimate slope is used
+        entirely.
 
         When only one segment exists, blending is skipped regardless of
         ``alpha``.
+    trend_yoy_blend : float
+        Weight on a trend-growth-implied IPM projection for compound holiday
+        blocks (0 = pure OLS, 1 = pure trend-implied).  Default ``0.0``
+        (backward-compatible).
+
+        The trend-implied projection scales the most-recent historical IPM
+        by the de-seasonalized YoY growth ratio observed in the V1 residual
+        (recent 90-day window vs the same window one year prior).  This
+        prevents the OLS slope from over-extrapolating BFCM magnitude when
+        the underlying business growth rate is moderate: holiday-season lift
+        is economically a multiplier on the baseline level, not an independent
+        quantity.
 
     Raises
     ------
@@ -54,8 +69,8 @@ class SeqdForecaster:
 
     Examples
     --------
-    >>> forecaster = SeqdForecaster(result, slope_blend_alpha=0.3)
-    >>> forecaster.fit(changepoint_penalty_beta=3.0, min_segment_size=90)
+    >>> forecaster = SeqdForecaster(result, slope_blend_alpha=0.5, trend_yoy_blend=0.5)
+    >>> forecaster.fit(changepoint_penalty_beta=3.0, min_segment_size=60)
     >>> fr = forecaster.predict(horizon=365)
     >>> fr.forecast.head()
     """
@@ -63,7 +78,8 @@ class SeqdForecaster:
     def __init__(
         self,
         result: DecompositionResult,
-        slope_blend_alpha: float = 0.0,
+        slope_blend_alpha: float = 0.5,
+        trend_yoy_blend: float = 0.0,
     ) -> None:
         if len(result.residual) < 2:
             raise ValueError(
@@ -74,8 +90,13 @@ class SeqdForecaster:
             raise ValueError(
                 f"slope_blend_alpha must be in [0.0, 1.0] (got {slope_blend_alpha})."
             )
+        if not (0.0 <= trend_yoy_blend <= 1.0):
+            raise ValueError(
+                f"trend_yoy_blend must be in [0.0, 1.0] (got {trend_yoy_blend})."
+            )
         self._result = result
         self._slope_blend_alpha = slope_blend_alpha
+        self._trend_yoy_blend = trend_yoy_blend
         self._fitted = False
         self._changepoints: Optional[List[pd.Timestamp]] = None
         self._segments: Optional[List[SegmentTrend]] = None
@@ -269,6 +290,7 @@ class SeqdForecaster:
             forecast_dates=forecast_dates,
             future_holidays=future_holidays,
             max_holiday_merge_gap_days=max_holiday_merge_gap_days,
+            trend_yoy_blend=self._trend_yoy_blend,
         )
 
         # --- Combine ---
@@ -350,14 +372,16 @@ def forecast_from_result(
     min_segment_size: int = 60,
     aic_linear_delta: float = 2.0,
     max_extrapolation_days: int = 365,
-    slope_blend_alpha: float = 0.0,
+    slope_blend_alpha: float = 0.5,
     max_holiday_merge_gap_days: int = 35,
+    trend_yoy_blend: float = 0.0,
 ) -> ForecastResult:
     """Convenience wrapper: fit and forecast in one call.
 
     Equivalent to::
 
-        SeqdForecaster(result, slope_blend_alpha=slope_blend_alpha).fit(
+        SeqdForecaster(result, slope_blend_alpha=slope_blend_alpha,
+                       trend_yoy_blend=trend_yoy_blend).fit(
             changepoint_penalty_beta=changepoint_penalty_beta,
             min_segment_size=min_segment_size,
             aic_linear_delta=aic_linear_delta,
@@ -385,16 +409,22 @@ def forecast_from_result(
     max_extrapolation_days : int
         See :meth:`SeqdForecaster.predict`.
     slope_blend_alpha : float
-        See :class:`SeqdForecaster`.  Default 0.0 (no blending).
+        See :class:`SeqdForecaster`.  Default 0.5.
     max_holiday_merge_gap_days : int
         See :meth:`SeqdForecaster.predict`.  Default 35.
+    trend_yoy_blend : float
+        See :class:`SeqdForecaster`.  Default 0.0 (pure OLS).
 
     Returns
     -------
     ForecastResult
     """
     return (
-        SeqdForecaster(result, slope_blend_alpha=slope_blend_alpha)
+        SeqdForecaster(
+            result,
+            slope_blend_alpha=slope_blend_alpha,
+            trend_yoy_blend=trend_yoy_blend,
+        )
         .fit(
             changepoint_penalty_beta=changepoint_penalty_beta,
             min_segment_size=min_segment_size,

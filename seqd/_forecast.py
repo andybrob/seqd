@@ -390,7 +390,74 @@ def _ols_project_ipm(ipm_pairs: List[tuple], max_years: int = 4) -> float:
     return projected
 
 
-def _compute_ipm_projection(h_name: str, matching) -> float:
+def _trend_linked_ipm(
+    result: "DecompositionResult",
+    projected_ipm_ols: float,
+    last_known_ipm: float,
+    trend_yoy_blend: float = 0.5,
+) -> float:
+    """Blend OLS IPM projection with a trend-growth-implied projection.
+
+    The holiday-season lift is economically a multiplier on the underlying
+    business level, not an independent quantity.  If the business grew 5% YoY
+    in recent months, BFCM magnitude should also grow ~5% — not the (often
+    larger) linear extrapolation from historical IPM growth.
+
+    The de-seasonalized YoY growth rate is estimated from the V1 residual:
+    the residual already has weekly, holiday, and annual components removed,
+    so its mean is a clean estimate of the underlying trend level.
+
+    Parameters
+    ----------
+    result : DecompositionResult
+        V1 decomposition result (provides residual series).
+    projected_ipm_ols : float
+        OLS-based IPM projection (from ``_ols_project_ipm``).
+    last_known_ipm : float
+        Most-recent reliable IPM value.
+    trend_yoy_blend : float
+        Weight on the trend-implied projection (0 = pure OLS,
+        1 = pure trend-implied).  Default 0.5.
+
+    Returns
+    -------
+    float
+        Blended IPM projection (>= 0).
+    """
+    if trend_yoy_blend <= 0.0:
+        return projected_ipm_ols
+
+    residual = result.residual
+    n = len(residual)
+
+    # Recent 90-day window and same window one year prior
+    recent = residual.iloc[max(0, n - 90):]
+    prior = residual.iloc[max(0, n - 90 - 365):max(0, n - 365)]
+
+    if len(recent) < 30 or len(prior) < 30:
+        return projected_ipm_ols  # not enough data for trend estimate
+
+    recent_mean = recent.mean()
+    prior_mean = prior.mean()
+
+    if prior_mean <= 0:
+        return projected_ipm_ols
+
+    # De-seasonalized YoY growth from recent trend
+    trend_yoy_ratio = recent_mean / prior_mean
+    trend_implied_ipm = last_known_ipm * trend_yoy_ratio
+
+    # Blend: trend_yoy_blend on trend-implied, (1-blend) on OLS
+    blended = trend_yoy_blend * trend_implied_ipm + (1.0 - trend_yoy_blend) * projected_ipm_ols
+    return max(blended, 0.0)
+
+
+def _compute_ipm_projection(
+    h_name: str,
+    matching,
+    result: Optional["DecompositionResult"] = None,
+    trend_yoy_blend: float = 0.0,
+) -> float:
     """Compute projected IPM for a compound holiday from its historical occurrences.
 
     Parameters
@@ -399,6 +466,13 @@ def _compute_ipm_projection(h_name: str, matching) -> float:
         Holiday name (for warnings).
     matching : list of HolidayEffect
         All HolidayEffect objects for this holiday name.
+    result : DecompositionResult or None
+        V1 decomposition result.  Required when ``trend_yoy_blend > 0``
+        to compute the trend-linked IPM projection.  Ignored when
+        ``trend_yoy_blend == 0``.
+    trend_yoy_blend : float
+        Weight on the trend-growth-implied IPM projection (see
+        ``_trend_linked_ipm``).  Default 0.0 (pure OLS, backward-compatible).
 
     Returns
     -------
@@ -448,6 +522,17 @@ def _compute_ipm_projection(h_name: str, matching) -> float:
     positive_ipms = [v for _, v in ipm_pairs if v >= 0] if ipm_pairs else []
     if positive_ipms and projected_ipm < 0:
         projected_ipm = min(positive_ipms) / 2.0
+
+    # Trend-linked blending: dampen OLS over-extrapolation with de-seasonalized
+    # YoY business growth rate from the V1 residual.
+    if trend_yoy_blend > 0.0 and result is not None and ipm_pairs:
+        last_known_ipm = float(ipm_pairs[-1][1])
+        projected_ipm = _trend_linked_ipm(
+            result=result,
+            projected_ipm_ols=projected_ipm,
+            last_known_ipm=last_known_ipm,
+            trend_yoy_blend=trend_yoy_blend,
+        )
 
     return projected_ipm
 
@@ -536,6 +621,7 @@ def _project_holidays(
     forecast_dates: pd.DatetimeIndex,
     future_holidays: Dict[str, List[pd.Timestamp]],
     max_holiday_merge_gap_days: int = 35,
+    trend_yoy_blend: float = 0.0,
 ) -> np.ndarray:
     """Project holiday effects onto forecast dates.
 
@@ -564,6 +650,9 @@ def _project_holidays(
     max_holiday_merge_gap_days : int
         Maximum date gap in days for grouping future compound holidays into
         a single max-pooled group.  Default 35.
+    trend_yoy_blend : float
+        Weight on trend-growth-implied IPM projection (see
+        ``_trend_linked_ipm``).  Default 0.0 (pure OLS, backward-compatible).
 
     Returns
     -------
@@ -605,7 +694,9 @@ def _project_holidays(
         projected_ipms: Dict[str, float] = {}
         for h_name in compound_future:
             matching = [he for he in result.holidays if he.name == h_name]
-            projected_ipms[h_name] = _compute_ipm_projection(h_name, matching)
+            projected_ipms[h_name] = _compute_ipm_projection(
+                h_name, matching, result=result, trend_yoy_blend=trend_yoy_blend
+            )
 
         # Group future holidays by date proximity
         groups = _group_future_holidays_by_proximity(

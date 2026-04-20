@@ -307,9 +307,9 @@ def test_segment_count_positive():
 
 
 def test_version_bumped():
-    """Package version should be 0.2.1."""
+    """Package version should be 0.2.2."""
     import seqd
-    assert seqd.__version__ == "0.2.1"
+    assert seqd.__version__ == "0.2.2"
 
 
 # ---------------------------------------------------------------------------
@@ -637,15 +637,16 @@ def test_slope_blend_alpha_invalid_raises():
         SeqdForecaster(result, slope_blend_alpha=-0.1)
 
 
-def test_slope_blend_alpha_zero_is_default():
-    """slope_blend_alpha=0.0 should produce the same forecast as no blending."""
+def test_slope_blend_alpha_default_is_0p5():
+    """Default slope_blend_alpha should be 0.5 (equal blend of penultimate and final slopes)."""
     result, _ = make_decomposition()
     fr_default = SeqdForecaster(result).fit().predict(horizon=60)
-    fr_zero = SeqdForecaster(result, slope_blend_alpha=0.0).fit().predict(horizon=60)
+    fr_explicit = SeqdForecaster(result, slope_blend_alpha=0.5).fit().predict(horizon=60)
     np.testing.assert_allclose(
         fr_default.trend_component.values,
-        fr_zero.trend_component.values,
+        fr_explicit.trend_component.values,
         rtol=1e-12,
+        err_msg="Default slope_blend_alpha should equal 0.5",
     )
 
 
@@ -1157,4 +1158,170 @@ def test_ols_project_ipm_growth_cap():
     # OLS: slope=20, projected=160. Cap: 140*1.4=196. 160 < 196, so not capped.
     assert abs(projected3 - 160.0) < 1.0, (
         f"Normal growth should not be capped: expected 160.0, got {projected3:.2f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trend-linked IPM projection (Improvement A)
+# ---------------------------------------------------------------------------
+
+
+def test_trend_yoy_blend_1_returns_trend_implied():
+    """With trend_yoy_blend=1.0, _compute_ipm_projection should return
+    exactly the trend-implied IPM (last_known_ipm * YoY residual ratio).
+
+    The test constructs a synthetic DecompositionResult where the residual
+    shows a known YoY growth ratio, then verifies that the blended IPM
+    equals last_known_ipm * ratio exactly.
+    """
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, HolidayEffect, WeeklyEffect,
+    )
+    from seqd._forecast import _compute_ipm_projection
+    import datetime
+
+    # Build a 2-year+90-day residual with known YoY growth.
+    # We want:
+    #   recent 90 days (days 395..484): mean = 200
+    #   prior 90 days (days 30..119): mean = 100
+    # So trend_yoy_ratio = 200 / 100 = 2.0.
+    # With last_known_ipm = 300, trend_implied_ipm = 300 * 2.0 = 600.
+    n = 485
+    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+
+    residual_values = np.ones(n) * 150.0  # default
+    # prior window: indices max(0, n-90-365)..max(0, n-365) = 30..120
+    # set to 100
+    residual_values[30:120] = 100.0
+    # recent window: indices max(0, n-90)..end = 395..484
+    # set to 200
+    residual_values[395:] = 200.0
+
+    y_series = pd.Series(residual_values, index=dates)
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=[],
+        annual=annual,
+        residual=y_series.copy(),
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    # Build two historical holiday occurrences with known IPMs.
+    # last_known_ipm = 300 (most recent reliable occurrence).
+    block_id = "compound_block_test"
+
+    def make_he(yr, ipm_val):
+        return HolidayEffect(
+            date=datetime.date(yr, 11, 25),
+            name="Test Holiday",
+            ramp_start=datetime.date(yr, 11, 1),
+            ramp_end=datetime.date(yr, 12, 5),
+            magnitude=100.0,
+            effect_series=pd.Series(0.0, index=dates),
+            year_magnitudes=[100.0],
+            magnitude_drift=0.0,
+            compound=True,
+            compound_block_id=block_id,
+            individual_peak_magnitude=ipm_val,
+            ramp_start_ceiling_hit=False,
+            individual_peak_magnitude_reliable=True,
+        )
+
+    he_2022 = make_he(2022, 250.0)  # prior year: not the last known
+    he_2023 = make_he(2023, 300.0)  # last known IPM = 300
+
+    matching = [he_2022, he_2023]
+
+    # With trend_yoy_blend=1.0, result should be exactly trend-implied.
+    # residual recent (n-90..n): mean of residual_values[395:485] = 200.0
+    # residual prior (n-90-365..n-365): = residual_values[30:120] = 100.0
+    # trend_yoy_ratio = 200.0 / 100.0 = 2.0
+    # trend_implied_ipm = 300.0 * 2.0 = 600.0
+    # With blend=1.0: blended = 1.0 * 600.0 + 0.0 * ols = 600.0
+    projected = _compute_ipm_projection(
+        "Test Holiday", matching, result=result, trend_yoy_blend=1.0
+    )
+
+    expected_trend_implied = 300.0 * 2.0  # = 600.0
+    assert abs(projected - expected_trend_implied) < 1.0, (
+        f"trend_yoy_blend=1.0 should return exactly trend-implied IPM "
+        f"({expected_trend_implied:.1f}), got {projected:.2f}"
+    )
+
+
+def test_trend_yoy_blend_0_returns_ols():
+    """With trend_yoy_blend=0.0, _compute_ipm_projection returns pure OLS result."""
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, HolidayEffect, WeeklyEffect,
+    )
+    from seqd._forecast import _compute_ipm_projection, _ols_project_ipm
+    import datetime
+
+    n = 500
+    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+    y_series = pd.Series(np.ones(n) * 100.0, index=dates)
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=[],
+        annual=annual,
+        residual=y_series.copy(),
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    def make_he(yr, ipm_val):
+        import datetime as dt
+        return HolidayEffect(
+            date=dt.date(yr, 11, 25),
+            name="Test Holiday",
+            ramp_start=dt.date(yr, 11, 1),
+            ramp_end=dt.date(yr, 12, 5),
+            magnitude=100.0,
+            effect_series=pd.Series(0.0, index=dates),
+            year_magnitudes=[100.0],
+            magnitude_drift=0.0,
+            compound=True,
+            compound_block_id="block_1",
+            individual_peak_magnitude=ipm_val,
+            ramp_start_ceiling_hit=False,
+            individual_peak_magnitude_reliable=True,
+        )
+
+    he_2022 = make_he(2022, 200.0)
+    he_2023 = make_he(2023, 300.0)
+    matching = [he_2022, he_2023]
+
+    projected_blend0 = _compute_ipm_projection(
+        "Test Holiday", matching, result=result, trend_yoy_blend=0.0
+    )
+    ols_only = _ols_project_ipm([(0, 200.0), (1, 300.0)])
+
+    assert abs(projected_blend0 - ols_only) < 1e-9, (
+        f"trend_yoy_blend=0.0 should equal pure OLS ({ols_only:.2f}), "
+        f"got {projected_blend0:.2f}"
     )
