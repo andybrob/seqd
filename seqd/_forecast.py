@@ -335,12 +335,21 @@ def _project_annual(
 # ---------------------------------------------------------------------------
 
 
-def _ols_project_ipm(ipm_pairs: List[tuple]) -> float:
+def _ols_project_ipm(ipm_pairs: List[tuple], max_years: int = 4) -> float:
     """Project next IPM from a list of (year, magnitude) pairs using OLS.
+
+    Uses only the most recent ``max_years`` data points (recency weighting by
+    truncation).  This prevents over-projection on concave growth series where
+    early high-growth years inflate the OLS slope.
+
+    If the projected IPM implies >40% YoY growth from the most recent known
+    IPM, the projection is capped at 40% above the most recent value.
 
     Parameters
     ----------
     ipm_pairs : list of (year_index, magnitude) tuples, sorted by year.
+    max_years : int
+        Maximum number of most-recent years to use for OLS.  Default 4.
 
     Returns
     -------
@@ -352,37 +361,197 @@ def _ols_project_ipm(ipm_pairs: List[tuple]) -> float:
         return 0.0
     if n == 1:
         return float(ipm_pairs[0][1])
-    x_arr = np.array([p[0] for p in ipm_pairs], dtype=float)
-    y_arr = np.array([p[1] for p in ipm_pairs], dtype=float)
-    xm = x_arr.mean()
-    ym = y_arr.mean()
-    denom = np.sum((x_arr - xm) ** 2)
-    if denom == 0.0:
-        slope = 0.0
+
+    # Apply recency window: use only the last max_years pairs
+    years_to_use = min(max_years, n)
+    recent_pairs = ipm_pairs[-years_to_use:]
+
+    x_arr = np.array([p[0] for p in recent_pairs], dtype=float)
+    y_arr = np.array([p[1] for p in recent_pairs], dtype=float)
+
+    if len(recent_pairs) == 1:
+        projected = float(y_arr[0])
     else:
-        slope = float(np.sum((x_arr - xm) * (y_arr - ym)) / denom)
-    # Project to the next year index (last x + 1)
-    return float(y_arr[-1]) + slope
+        xm = x_arr.mean()
+        ym = y_arr.mean()
+        denom = np.sum((x_arr - xm) ** 2)
+        if denom == 0.0:
+            slope = 0.0
+        else:
+            slope = float(np.sum((x_arr - xm) * (y_arr - ym)) / denom)
+        # Project to the next year index (last x + 1)
+        projected = float(y_arr[-1]) + slope
+
+    # Growth cap: if projected > most_recent * 1.4, cap it
+    most_recent_ipm = float(ipm_pairs[-1][1])
+    if most_recent_ipm > 0 and projected > most_recent_ipm * 1.4:
+        projected = most_recent_ipm * 1.4
+
+    return projected
+
+
+def _compute_ipm_projection(h_name: str, matching) -> float:
+    """Compute projected IPM for a compound holiday from its historical occurrences.
+
+    Parameters
+    ----------
+    h_name : str
+        Holiday name (for warnings).
+    matching : list of HolidayEffect
+        All HolidayEffect objects for this holiday name.
+
+    Returns
+    -------
+    float
+        Projected IPM for the next occurrence.
+    """
+    sorted_occ = sorted(matching, key=lambda he: he.date)
+    ipm_pairs = []
+    for idx, occ in enumerate(sorted_occ):
+        if (
+            occ.individual_peak_magnitude is not None
+            and occ.individual_peak_magnitude_reliable
+        ):
+            ipm_pairs.append((idx, occ.individual_peak_magnitude))
+
+    n_reliable = len(ipm_pairs)
+    if n_reliable >= 2:
+        projected_ipm = _ols_project_ipm(ipm_pairs)
+    elif n_reliable == 1:
+        projected_ipm = float(ipm_pairs[0][1])
+    else:
+        all_ipms = [
+            occ.individual_peak_magnitude
+            for occ in sorted_occ
+            if occ.individual_peak_magnitude is not None
+        ]
+        if all_ipms:
+            projected_ipm = float(np.mean(all_ipms))
+            warnings.warn(
+                f"Holiday '{h_name}': no reliable IPM values available. "
+                "Using mean of all occurrences as projection.",
+                UserWarning,
+                stacklevel=5,
+            )
+        else:
+            most_recent = sorted_occ[-1]
+            projected_ipm = most_recent.magnitude
+            warnings.warn(
+                f"Holiday '{h_name}': no IPM values available at all. "
+                "Falling back to block magnitude.",
+                UserWarning,
+                stacklevel=5,
+            )
+
+    # Guard: if all historical IPMs were positive and projection < 0,
+    # clamp to half the minimum observed IPM.
+    positive_ipms = [v for _, v in ipm_pairs if v >= 0] if ipm_pairs else []
+    if positive_ipms and projected_ipm < 0:
+        projected_ipm = min(positive_ipms) / 2.0
+
+    return projected_ipm
+
+
+def _triangular_ramp_contribution(
+    h_date: "_dt.date",
+    projected_ipm: float,
+    forecast_date_set: Dict["_dt.date", int],
+    min_fc_date: "_dt.date",
+    max_fc_date: "_dt.date",
+) -> Dict["_dt.date", float]:
+    """Compute triangular ramp contributions for a single holiday occurrence.
+
+    Returns a dict mapping forecast date → contribution value for all days
+    within ±3 days of h_date that fall in the forecast window.
+    """
+    contribs: Dict["_dt.date", float] = {}
+    for day_delta in range(-3, 4):
+        eff_date = h_date + _dt.timedelta(days=day_delta)
+        if eff_date < min_fc_date or eff_date > max_fc_date:
+            continue
+        if eff_date not in forecast_date_set:
+            continue
+        weight = max(0.0, 1.0 - abs(day_delta) / 4.0)
+        contribs[eff_date] = projected_ipm * weight
+    return contribs
+
+
+def _group_future_holidays_by_proximity(
+    future_holidays: Dict[str, List[pd.Timestamp]],
+    max_holiday_merge_gap_days: int,
+) -> List[List[tuple]]:
+    """Group future (holiday_name, holiday_date) pairs into compound groups.
+
+    Two holidays belong in the same group if any member of the group is within
+    ``max_holiday_merge_gap_days`` days of the candidate.
+
+    Holidays NOT in the compound projection path (i.e., non-compound per
+    result.holidays) are excluded before calling this function — this function
+    works purely on (name, date) pairs.
+
+    Parameters
+    ----------
+    future_holidays : dict
+        Mapping from holiday name to list of future dates.
+    max_holiday_merge_gap_days : int
+        Maximum gap in days between holiday dates for them to be grouped.
+
+    Returns
+    -------
+    list of groups
+        Each group is a list of (h_name, h_date as _dt.date) tuples.
+    """
+    # Flatten to (name, date) pairs, sorted by date
+    all_pairs: List[tuple] = []
+    for h_name, dates in future_holidays.items():
+        for d in dates:
+            all_pairs.append((h_name, pd.Timestamp(d).date()))
+    all_pairs.sort(key=lambda x: x[1])
+
+    if not all_pairs:
+        return []
+
+    groups: List[List[tuple]] = []
+    current_group: List[tuple] = [all_pairs[0]]
+
+    for pair in all_pairs[1:]:
+        _, d_new = pair
+        # Check if d_new is within gap of any member in current group
+        in_group = any(
+            abs((d_new - d_existing).days) <= max_holiday_merge_gap_days
+            for _, d_existing in current_group
+        )
+        if in_group:
+            current_group.append(pair)
+        else:
+            groups.append(current_group)
+            current_group = [pair]
+
+    groups.append(current_group)
+    return groups
 
 
 def _project_holidays(
     result: DecompositionResult,
     forecast_dates: pd.DatetimeIndex,
     future_holidays: Dict[str, List[pd.Timestamp]],
+    max_holiday_merge_gap_days: int = 35,
 ) -> np.ndarray:
     """Project holiday effects onto forecast dates.
 
     For **compound block members** the projection uses
     ``individual_peak_magnitude`` (IPM) and a triangular ramp (±3 days)
-    centred on the holiday date.  This avoids the flat block-mean
-    ``effect_series`` (~$80M) distorting individual holiday peaks (e.g.
-    Black Friday $584M).
+    centred on the holiday date.
+
+    **Compound ramp max-pooling** (Fix A): when multiple future holidays fall
+    within ``max_holiday_merge_gap_days`` days of each other, their triangular
+    ramp contributions are max-pooled rather than summed.  This prevents
+    double-counting when Thanksgiving (Nov 27), Black Friday (Nov 28), and
+    Cyber Monday (Dec 1) each add a ramp to the same forecast days.
 
     For **non-compound holidays** the legacy shape-scaling path is used
     (project ``year_magnitudes`` via OLS, normalise the reference
     ``effect_series``, scale by projected magnitude).
-
-    Overlapping ramp windows are summed.
 
     Parameters
     ----------
@@ -392,19 +561,25 @@ def _project_holidays(
         Forecast dates.
     future_holidays : dict
         Mapping from holiday name (str) to list of future occurrence dates.
+    max_holiday_merge_gap_days : int
+        Maximum date gap in days for grouping future compound holidays into
+        a single max-pooled group.  Default 35.
 
     Returns
     -------
     np.ndarray
-        Shape ``(len(forecast_dates),)``, summed holiday effects.
+        Shape ``(len(forecast_dates),)``, combined holiday effects.
     """
     holiday_array = np.zeros(len(forecast_dates))
     forecast_date_set = {d.date(): i for i, d in enumerate(forecast_dates)}
     min_fc_date = forecast_dates[0].date()
     max_fc_date = forecast_dates[-1].date()
 
+    # Separate future holidays into compound and non-compound sets
+    compound_future: Dict[str, List[pd.Timestamp]] = {}
+    noncompound_future: Dict[str, List[pd.Timestamp]] = {}
+
     for h_name, future_dates in future_holidays.items():
-        # Find all HolidayEffect objects matching this holiday name
         matching = [he for he in result.holidays if he.name == h_name]
 
         if not matching:
@@ -416,155 +591,135 @@ def _project_holidays(
             )
             continue
 
-        # Determine if this holiday is a compound block member
         is_compound = any(he.compound for he in matching)
-
         if is_compound:
-            # ----------------------------------------------------------
-            # IPM-based projection for compound block members
-            # ----------------------------------------------------------
-            # Collect reliable (year_index, ipm) pairs from all occurrences,
-            # sorted by date.
-            sorted_occ = sorted(matching, key=lambda he: he.date)
-            ipm_pairs = []
-            for idx, occ in enumerate(sorted_occ):
-                if (
-                    occ.individual_peak_magnitude is not None
-                    and occ.individual_peak_magnitude_reliable
-                ):
-                    ipm_pairs.append((idx, occ.individual_peak_magnitude))
-
-            n_reliable = len(ipm_pairs)
-            if n_reliable >= 2:
-                projected_ipm = _ols_project_ipm(ipm_pairs)
-            elif n_reliable == 1:
-                projected_ipm = float(ipm_pairs[0][1])
-            else:
-                # No reliable IPM values — fall back to mean of all available
-                all_ipms = [
-                    occ.individual_peak_magnitude
-                    for occ in sorted_occ
-                    if occ.individual_peak_magnitude is not None
-                ]
-                if all_ipms:
-                    projected_ipm = float(np.mean(all_ipms))
-                    warnings.warn(
-                        f"Holiday '{h_name}': no reliable IPM values available. "
-                        "Using mean of all occurrences as projection.",
-                        UserWarning,
-                        stacklevel=4,
-                    )
-                else:
-                    # Absolute fallback: use block magnitude of most recent occurrence
-                    most_recent = sorted_occ[-1]
-                    projected_ipm = most_recent.magnitude
-                    warnings.warn(
-                        f"Holiday '{h_name}': no IPM values available at all. "
-                        "Falling back to block magnitude.",
-                        UserWarning,
-                        stacklevel=4,
-                    )
-
-            # Guard: if all historical IPMs were positive and projection < 0,
-            # clamp to half the minimum observed IPM.
-            positive_ipms = [v for _, v in ipm_pairs if v >= 0] if ipm_pairs else []
-            if positive_ipms and projected_ipm < 0:
-                projected_ipm = min(positive_ipms) / 2.0
-
-            # Map each future occurrence to the forecast array using a
-            # triangular ramp: effect[d] = projected_ipm * max(0, 1 - |d - hdate|/4)
-            # This spans ±3 days around the holiday date with the peak on h_date.
-            for future_date in future_dates:
-                h_date = pd.Timestamp(future_date).date()
-                for day_delta in range(-3, 4):
-                    eff_date = h_date + _dt.timedelta(days=day_delta)
-                    if eff_date < min_fc_date or eff_date > max_fc_date:
-                        continue
-                    if eff_date not in forecast_date_set:
-                        continue
-                    weight = max(0.0, 1.0 - abs(day_delta) / 4.0)
-                    fc_idx = forecast_date_set[eff_date]
-                    holiday_array[fc_idx] += projected_ipm * weight
-
+            compound_future[h_name] = future_dates
         else:
-            # ----------------------------------------------------------
-            # Legacy shape-scaling path for non-compound holidays
-            # ----------------------------------------------------------
-            year_mags = matching[0].year_magnitudes
+            noncompound_future[h_name] = future_dates
 
-            # Project next magnitude via OLS
-            Y = len(year_mags)
-            if Y == 0:
-                most_recent_he = max(matching, key=lambda he: he.date)
-                projected_mag = most_recent_he.magnitude
-            elif Y == 1:
-                projected_mag = float(year_mags[0])
+    # ------------------------------------------------------------------
+    # Compound holidays: max-pooling within proximity groups
+    # ------------------------------------------------------------------
+    if compound_future:
+        # Pre-compute projected IPM for each compound holiday
+        projected_ipms: Dict[str, float] = {}
+        for h_name in compound_future:
+            matching = [he for he in result.holidays if he.name == h_name]
+            projected_ipms[h_name] = _compute_ipm_projection(h_name, matching)
+
+        # Group future holidays by date proximity
+        groups = _group_future_holidays_by_proximity(
+            compound_future, max_holiday_merge_gap_days
+        )
+
+        for group in groups:
+            if len(group) == 1:
+                # Single holiday in group — add directly (no overlap issue)
+                h_name, h_date = group[0]
+                ipm = projected_ipms[h_name]
+                for eff_date, contrib in _triangular_ramp_contribution(
+                    h_date, ipm, forecast_date_set, min_fc_date, max_fc_date
+                ).items():
+                    holiday_array[forecast_date_set[eff_date]] += contrib
             else:
-                y_arr = np.array(year_mags, dtype=float)
-                x_arr = np.arange(Y, dtype=float)
-                xm = x_arr.mean()
-                ym = y_arr.mean()
-                denom = np.sum((x_arr - xm) ** 2)
-                if denom == 0.0:
-                    slope = 0.0
-                else:
-                    slope = float(np.sum((x_arr - xm) * (y_arr - ym)) / denom)
-                projected_mag = float(y_arr[-1]) + slope
+                # Multiple holidays in group — collect all ramp contributions
+                # per forecast date, then take MAX within the group
+                # Build: date → list of contributions from all group members
+                date_contributions: Dict["_dt.date", List[float]] = {}
+                for h_name, h_date in group:
+                    ipm = projected_ipms[h_name]
+                    for eff_date, contrib in _triangular_ramp_contribution(
+                        h_date, ipm, forecast_date_set, min_fc_date, max_fc_date
+                    ).items():
+                        if eff_date not in date_contributions:
+                            date_contributions[eff_date] = []
+                        date_contributions[eff_date].append(contrib)
 
-            # Negative projection guard
-            if Y > 0 and all(m >= 0 for m in year_mags) and projected_mag < 0:
-                projected_mag = min(float(m) for m in year_mags) / 2.0
+                # Max-pool within group, then add to holiday_array
+                for eff_date, contribs in date_contributions.items():
+                    holiday_array[forecast_date_set[eff_date]] += max(contribs)
 
-            # Find best reference ramp shape
-            sorted_occ = sorted(matching, key=lambda he: he.date, reverse=True)
+    # ------------------------------------------------------------------
+    # Non-compound holidays: legacy shape-scaling path
+    # ------------------------------------------------------------------
+    for h_name, future_dates in noncompound_future.items():
+        matching = [he for he in result.holidays if he.name == h_name]
 
-            ref_he = None
-            for occ in sorted_occ:
-                if not occ.ramp_start_ceiling_hit and occ.individual_peak_magnitude_reliable:
-                    ref_he = occ
-                    break
+        year_mags = matching[0].year_magnitudes
 
-            if ref_he is None:
-                ref_he = sorted_occ[0]
-                warnings.warn(
-                    f"Holiday '{h_name}': all historical occurrences have unreliable "
-                    "ramp shapes (ceiling hit or boundary truncation). "
-                    "Using most recent; shape may be truncated.",
-                    UserWarning,
-                    stacklevel=4,
-                )
+        # Project next magnitude via OLS
+        Y = len(year_mags)
+        if Y == 0:
+            most_recent_he = max(matching, key=lambda he: he.date)
+            projected_mag = most_recent_he.magnitude
+        elif Y == 1:
+            projected_mag = float(year_mags[0])
+        else:
+            y_arr = np.array(year_mags, dtype=float)
+            x_arr = np.arange(Y, dtype=float)
+            xm = x_arr.mean()
+            ym = y_arr.mean()
+            denom = np.sum((x_arr - xm) ** 2)
+            if denom == 0.0:
+                slope = 0.0
+            else:
+                slope = float(np.sum((x_arr - xm) * (y_arr - ym)) / denom)
+            projected_mag = float(y_arr[-1]) + slope
 
-            # Restrict effect series to [ramp_start, ramp_end]
-            ref_effect = ref_he.effect_series.copy()
-            ramp_start_ts = pd.Timestamp(ref_he.ramp_start)
-            ramp_end_ts = pd.Timestamp(ref_he.ramp_end)
-            ref_effect = ref_effect.loc[ramp_start_ts:ramp_end_ts]
+        # Negative projection guard
+        if Y > 0 and all(m >= 0 for m in year_mags) and projected_mag < 0:
+            projected_mag = min(float(m) for m in year_mags) / 2.0
 
-            ref_mag = ref_he.magnitude
-            if abs(ref_mag) < 1e-10:
-                continue
+        # Find best reference ramp shape
+        sorted_occ = sorted(matching, key=lambda he: he.date, reverse=True)
 
-            unit_shape = ref_effect / ref_mag
-            ref_h_date = pd.Timestamp(ref_he.date)
-            offset_days = (ref_h_date - ramp_start_ts).days
+        ref_he = None
+        for occ in sorted_occ:
+            if not occ.ramp_start_ceiling_hit and occ.individual_peak_magnitude_reliable:
+                ref_he = occ
+                break
 
-            for future_date in future_dates:
-                future_ts = pd.Timestamp(future_date)
-                future_ramp_start = future_ts - pd.Timedelta(days=offset_days)
-                projected_effect = unit_shape * projected_mag
+        if ref_he is None:
+            ref_he = sorted_occ[0]
+            warnings.warn(
+                f"Holiday '{h_name}': all historical occurrences have unreliable "
+                "ramp shapes (ceiling hit or boundary truncation). "
+                "Using most recent; shape may be truncated.",
+                UserWarning,
+                stacklevel=4,
+            )
 
-                for eff_date_ts, eff_val in projected_effect.items():
-                    day_offset = (eff_date_ts - ramp_start_ts).days
-                    future_eff_date = (
-                        future_ramp_start + pd.Timedelta(days=day_offset)
-                    ).date()
+        # Restrict effect series to [ramp_start, ramp_end]
+        ref_effect = ref_he.effect_series.copy()
+        ramp_start_ts = pd.Timestamp(ref_he.ramp_start)
+        ramp_end_ts = pd.Timestamp(ref_he.ramp_end)
+        ref_effect = ref_effect.loc[ramp_start_ts:ramp_end_ts]
 
-                    if future_eff_date < min_fc_date or future_eff_date > max_fc_date:
-                        continue
+        ref_mag = ref_he.magnitude
+        if abs(ref_mag) < 1e-10:
+            continue
 
-                    if future_eff_date in forecast_date_set:
-                        fc_idx = forecast_date_set[future_eff_date]
-                        holiday_array[fc_idx] += eff_val
+        unit_shape = ref_effect / ref_mag
+        ref_h_date = pd.Timestamp(ref_he.date)
+        offset_days = (ref_h_date - ramp_start_ts).days
+
+        for future_date in future_dates:
+            future_ts = pd.Timestamp(future_date)
+            future_ramp_start = future_ts - pd.Timedelta(days=offset_days)
+            projected_effect = unit_shape * projected_mag
+
+            for eff_date_ts, eff_val in projected_effect.items():
+                day_offset = (eff_date_ts - ramp_start_ts).days
+                future_eff_date = (
+                    future_ramp_start + pd.Timedelta(days=day_offset)
+                ).date()
+
+                if future_eff_date < min_fc_date or future_eff_date > max_fc_date:
+                    continue
+
+                if future_eff_date in forecast_date_set:
+                    fc_idx = forecast_date_set[future_eff_date]
+                    holiday_array[fc_idx] += eff_val
 
     return holiday_array
 

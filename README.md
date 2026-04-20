@@ -791,7 +791,7 @@ result = SeqdDecomposer(holiday_dates=holidays, holiday_window=50).fit(y)
 forecaster = SeqdForecaster(result)
 forecaster.fit(
     changepoint_penalty_beta=3.0,   # β for λ = σ̂² β ln(n); range [1, 6]
-    min_segment_size=90,             # minimum segment days; default 90 (one quarter)
+    min_segment_size=60,             # minimum segment days; default 60 (v0.2.1+)
     aic_linear_delta=2.0,            # AIC parsimony threshold for linear preference
 )
 
@@ -829,7 +829,7 @@ fr = forecast_from_result(
     horizon=365,
     future_holidays={"Black Friday": [pd.Timestamp(2026, 11, 27)]},
     changepoint_penalty_beta=3.0,
-    min_segment_size=90,
+    min_segment_size=60,
     aic_linear_delta=2.0,
     max_extrapolation_days=365,
 )

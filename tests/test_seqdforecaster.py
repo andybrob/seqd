@@ -307,9 +307,9 @@ def test_segment_count_positive():
 
 
 def test_version_bumped():
-    """Package version should be 0.2.0."""
+    """Package version should be 0.2.1."""
     import seqd
-    assert seqd.__version__ == "0.2.0"
+    assert seqd.__version__ == "0.2.1"
 
 
 # ---------------------------------------------------------------------------
@@ -990,4 +990,171 @@ def test_compound_block_ipm_projection_peak_on_holiday_date():
     peak_date = window.idxmax()
     assert peak_date == bf_2023, (
         f"Peak holiday effect should be on {bf_2023.date()}, but was on {peak_date.date()}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix A: Overlapping compound holidays use MAX not SUM
+# ---------------------------------------------------------------------------
+
+
+def test_overlapping_compound_holidays_use_max_not_sum():
+    """Two compound holidays within 3 days of each other must be max-pooled.
+
+    Build two compound holidays (Thanksgiving Nov 27, Black Friday Nov 28)
+    whose triangular ramps fully overlap.  Verify that the combined effect on
+    Nov 28 equals the max of each individual effect, NOT their sum.
+
+    Without max-pooling (old behaviour), the Nov 28 value would be:
+      TG_ramp(Nov28) + BF_ramp(Nov28) = TG_ipm * 0.75 + BF_ipm * 1.0
+
+    With max-pooling (Fix A), it should be:
+      max(TG_ramp(Nov28), BF_ramp(Nov28)) = max(TG_ipm * 0.75, BF_ipm * 1.0)
+    """
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, HolidayEffect, WeeklyEffect,
+    )
+    from seqd._forecast import _project_holidays
+    import datetime
+
+    rng = np.random.default_rng(42)
+    n = 3 * 365
+    dates = pd.date_range("2021-01-01", periods=n, freq="D")
+    t = np.arange(n, dtype=float)
+    y_values = 100.0 + 0.05 * t + rng.normal(0, 2.0, n)
+    y_series = pd.Series(y_values, index=dates)
+
+    block_id = "compound_block_tg_bf_1"
+
+    def make_compound_he(yr, h_date, h_name, ipm_val):
+        rs = datetime.date(yr, 11, 1)
+        re = datetime.date(yr, 12, 10)
+        eff = pd.Series(0.0, index=dates)
+        return HolidayEffect(
+            date=h_date,
+            name=h_name,
+            ramp_start=rs,
+            ramp_end=re,
+            magnitude=50.0,
+            effect_series=eff,
+            year_magnitudes=[50.0],
+            magnitude_drift=0.0,
+            compound=True,
+            compound_block_id=block_id,
+            individual_peak_magnitude=ipm_val,
+            ramp_start_ceiling_hit=False,
+            individual_peak_magnitude_reliable=True,
+        )
+
+    # Thanksgiving Nov 27 with IPM=200, Black Friday Nov 28 with IPM=300
+    he_tg_2021 = make_compound_he(2021, datetime.date(2021, 11, 25), "Thanksgiving", 200.0)
+    he_tg_2022 = make_compound_he(2022, datetime.date(2022, 11, 24), "Thanksgiving", 220.0)
+    he_bf_2021 = make_compound_he(2021, datetime.date(2021, 11, 26), "Black Friday", 300.0)
+    he_bf_2022 = make_compound_he(2022, datetime.date(2022, 11, 25), "Black Friday", 350.0)
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=[he_tg_2021, he_tg_2022, he_bf_2021, he_bf_2022],
+        annual=annual,
+        residual=y_series.copy(),
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    # Future dates: Thanksgiving Nov 27 2023, Black Friday Nov 28 2023 (1 day apart)
+    tg_2023 = pd.Timestamp("2023-11-23")  # Thu
+    bf_2023 = pd.Timestamp("2023-11-24")  # Fri (1 day after TG)
+    forecast_dates = pd.date_range("2023-10-01", periods=120, freq="D")
+
+    # OLS for Thanksgiving: pairs (0,200),(1,220) → slope=20, projected=240
+    # OLS for Black Friday: pairs (0,300),(1,350) → slope=50, projected=400
+    # But with max_years=4 growth cap: BF projected = min(400, 350*1.4=490) = 400
+    tg_projected_ipm = 240.0
+    bf_projected_ipm = 400.0
+
+    holiday_arr = _project_holidays(
+        result=result,
+        forecast_dates=forecast_dates,
+        future_holidays={
+            "Thanksgiving": [tg_2023],
+            "Black Friday": [bf_2023],
+        },
+        max_holiday_merge_gap_days=35,
+    )
+
+    fc_series = pd.Series(holiday_arr, index=forecast_dates)
+
+    # On Black Friday (bf_2023): TG ramp contribution = tg_projected * weight(1 day after TG)
+    # weight = max(0, 1 - 1/4) = 0.75
+    # BF ramp contribution = bf_projected * weight(0 days from BF) = bf_projected * 1.0
+    tg_contrib_on_bf = tg_projected_ipm * (1.0 - 1.0 / 4.0)  # delta=+1 from TG
+    bf_contrib_on_bf = bf_projected_ipm * 1.0
+
+    # Max-pooled value should be max of the two contributions
+    expected_max = max(tg_contrib_on_bf, bf_contrib_on_bf)
+    # If summed instead: tg_contrib_on_bf + bf_contrib_on_bf
+    expected_sum = tg_contrib_on_bf + bf_contrib_on_bf
+
+    bf_actual = fc_series.loc[bf_2023]
+
+    # With max-pooling, value should equal expected_max (not expected_sum)
+    assert abs(bf_actual - expected_max) < 1.0, (
+        f"Expected max-pooled value ≈ {expected_max:.2f} on Black Friday, "
+        f"got {bf_actual:.2f}. "
+        f"(Sum would have been {expected_sum:.2f}; max is {expected_max:.2f}.)"
+    )
+    assert bf_actual < expected_sum - 1.0, (
+        f"Value should be less than the additive sum ({expected_sum:.2f}), "
+        f"confirming max-pooling is active. Got {bf_actual:.2f}."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix C: IPM growth cap at 40%
+# ---------------------------------------------------------------------------
+
+
+def test_ols_project_ipm_growth_cap():
+    """_ols_project_ipm should cap projected growth at 40% above most recent IPM.
+
+    Build a series that would project >40% above the most recent value via
+    pure OLS, and verify that the returned projection is capped at 1.4x the
+    most recent IPM.
+    """
+    from seqd._forecast import _ols_project_ipm
+
+    # ipm_pairs: (0, 100), (1, 200), (2, 400) — aggressive exponential growth
+    # OLS over last 4 years: slope would be large
+    # Most recent IPM = 400. 40% cap → projection capped at 560.
+    ipm_pairs = [(0, 100.0), (1, 200.0), (2, 400.0)]
+    projected = _ols_project_ipm(ipm_pairs, max_years=4)
+
+    # Uncapped OLS: x=[0,1,2], y=[100,200,400] → slope ≈ 150, projected = 400 + 150 = 550
+    # But 550 > 400 * 1.4 = 560? No — 550 < 560, so actually not capped in this case.
+    # Use a more extreme example: (0, 100), (1, 400) → slope=300, projected=700 > 400*1.4=560
+    ipm_pairs2 = [(0, 100.0), (1, 400.0)]
+    projected2 = _ols_project_ipm(ipm_pairs2, max_years=4)
+    # OLS: slope = 300, projected = 700. Cap: 400 * 1.4 = 560.
+    assert abs(projected2 - 560.0) < 1.0, (
+        f"Expected growth cap at 560.0 (400 * 1.4), got {projected2:.2f}"
+    )
+
+    # Verify that WITHOUT cap, we would exceed 1.4x: 700 > 560
+    # Also verify that normal (non-explosive) growth is NOT capped
+    ipm_pairs3 = [(0, 100.0), (1, 120.0), (2, 140.0)]  # linear +20/yr
+    projected3 = _ols_project_ipm(ipm_pairs3, max_years=4)
+    # OLS: slope=20, projected=160. Cap: 140*1.4=196. 160 < 196, so not capped.
+    assert abs(projected3 - 160.0) < 1.0, (
+        f"Normal growth should not be capped: expected 160.0, got {projected3:.2f}"
     )

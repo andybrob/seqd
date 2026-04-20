@@ -52,7 +52,7 @@ __all__ = [
     "forecast_from_result",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 class SeqdDecomposer:

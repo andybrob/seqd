@@ -123,7 +123,7 @@ class SeqdForecaster:
     def fit(
         self,
         changepoint_penalty_beta: float = 3.0,
-        min_segment_size: int = 90,
+        min_segment_size: int = 60,
         aic_linear_delta: float = 2.0,
     ) -> "SeqdForecaster":
         """Run Stages 4 and 5: changepoint detection and piecewise trend fitting.
@@ -134,9 +134,10 @@ class SeqdForecaster:
             Multiplier β for the BIC-inspired PELT penalty
             λ = σ̂² × β × ln(n).  Default 3.0.  Reasonable range [1.0, 6.0].
         min_segment_size : int
-            Minimum segment length in days for PELT.  Default 90.
-            Must satisfy ``n >= 2 * min_segment_size`` for changepoints to
-            be detectable.
+            Minimum segment length in days for PELT.  Default 60.
+            Lowered from 90 (v0.2.0) to improve detection of mid-year trend
+            breaks.  Must satisfy ``n >= 2 * min_segment_size`` for
+            changepoints to be detectable.
         aic_linear_delta : float
             AIC threshold δ below which linear is preferred over a
             better-fitting model.  Default 2.0.
@@ -182,6 +183,7 @@ class SeqdForecaster:
         horizon: int,
         future_holidays: Optional[Dict[str, List[pd.Timestamp]]] = None,
         max_extrapolation_days: int = 365,
+        max_holiday_merge_gap_days: int = 35,
     ) -> ForecastResult:
         """Run Stage 6: produce ``horizon``-day-ahead point forecasts.
 
@@ -198,6 +200,11 @@ class SeqdForecaster:
         max_extrapolation_days : int
             Emit a ``UserWarning`` when ``horizon > max_extrapolation_days``.
             Default 365.
+        max_holiday_merge_gap_days : int
+            Maximum date gap in days between future holiday dates for
+            grouping them into a compound proximity group for max-pooled
+            ramp projection.  Should match the value used in the V1
+            decomposer.  Default 35.
 
         Returns
         -------
@@ -261,6 +268,7 @@ class SeqdForecaster:
             result=result,
             forecast_dates=forecast_dates,
             future_holidays=future_holidays,
+            max_holiday_merge_gap_days=max_holiday_merge_gap_days,
         )
 
         # --- Combine ---
@@ -339,10 +347,11 @@ def forecast_from_result(
     horizon: int,
     future_holidays: Optional[Dict[str, List[pd.Timestamp]]] = None,
     changepoint_penalty_beta: float = 3.0,
-    min_segment_size: int = 90,
+    min_segment_size: int = 60,
     aic_linear_delta: float = 2.0,
     max_extrapolation_days: int = 365,
     slope_blend_alpha: float = 0.0,
+    max_holiday_merge_gap_days: int = 35,
 ) -> ForecastResult:
     """Convenience wrapper: fit and forecast in one call.
 
@@ -356,6 +365,7 @@ def forecast_from_result(
             horizon=horizon,
             future_holidays=future_holidays,
             max_extrapolation_days=max_extrapolation_days,
+            max_holiday_merge_gap_days=max_holiday_merge_gap_days,
         )
 
     Parameters
@@ -369,13 +379,15 @@ def forecast_from_result(
     changepoint_penalty_beta : float
         See :meth:`SeqdForecaster.fit`.
     min_segment_size : int
-        See :meth:`SeqdForecaster.fit`.
+        See :meth:`SeqdForecaster.fit`.  Default 60.
     aic_linear_delta : float
         See :meth:`SeqdForecaster.fit`.
     max_extrapolation_days : int
         See :meth:`SeqdForecaster.predict`.
     slope_blend_alpha : float
         See :class:`SeqdForecaster`.  Default 0.0 (no blending).
+    max_holiday_merge_gap_days : int
+        See :meth:`SeqdForecaster.predict`.  Default 35.
 
     Returns
     -------
@@ -392,5 +404,6 @@ def forecast_from_result(
             horizon=horizon,
             future_holidays=future_holidays,
             max_extrapolation_days=max_extrapolation_days,
+            max_holiday_merge_gap_days=max_holiday_merge_gap_days,
         )
     )
