@@ -33,6 +33,17 @@ class SeqdForecaster:
     slope_blend_alpha : float
         Weight placed on the penultimate segment's slope when blending for
         trend extrapolation (H1 fix).  Value must be in ``[0.0, 1.0]``.
+    ipm_max_years : int
+        Maximum number of most-recent historical years used when fitting the
+        OLS trend on individual peak magnitudes (IPM) for compound holiday
+        projection.  Default ``4``.  Reducing this value down-weights early
+        high-growth years, useful for concave growth series.  Must be >= 1.
+    ipm_decay_halflife : float
+        Exponential decay half-life in years for down-weighting older IPM
+        observations within the OLS fit window.  ``0.0`` (default) uses
+        uniform weights (standard OLS).  Values in ``(0, 2]`` progressively
+        down-weight older years: e.g. ``1.0`` gives year N-1 half the weight
+        of year N.
 
         ``blended_slope = alpha * slope_penultimate + (1 - alpha) * slope_final``
 
@@ -80,6 +91,8 @@ class SeqdForecaster:
         result: DecompositionResult,
         slope_blend_alpha: float = 0.5,
         trend_yoy_blend: float = 0.0,
+        ipm_max_years: int = 4,
+        ipm_decay_halflife: float = 0.0,
     ) -> None:
         if len(result.residual) < 2:
             raise ValueError(
@@ -94,9 +107,19 @@ class SeqdForecaster:
             raise ValueError(
                 f"trend_yoy_blend must be in [0.0, 1.0] (got {trend_yoy_blend})."
             )
+        if ipm_max_years < 1:
+            raise ValueError(
+                f"ipm_max_years must be >= 1 (got {ipm_max_years})."
+            )
+        if ipm_decay_halflife < 0.0:
+            raise ValueError(
+                f"ipm_decay_halflife must be >= 0.0 (got {ipm_decay_halflife})."
+            )
         self._result = result
         self._slope_blend_alpha = slope_blend_alpha
         self._trend_yoy_blend = trend_yoy_blend
+        self._ipm_max_years = ipm_max_years
+        self._ipm_decay_halflife = ipm_decay_halflife
         self._fitted = False
         self._changepoints: Optional[List[pd.Timestamp]] = None
         self._segments: Optional[List[SegmentTrend]] = None
@@ -146,6 +169,8 @@ class SeqdForecaster:
         changepoint_penalty_beta: float = 3.0,
         min_segment_size: int = 60,
         aic_linear_delta: float = 2.0,
+        enable_bfcm_carveout: bool = True,
+        bfcm_carveout_min_overlap_days: int = 30,
     ) -> "SeqdForecaster":
         """Run Stages 4 and 5: changepoint detection and piecewise trend fitting.
 
@@ -162,6 +187,19 @@ class SeqdForecaster:
         aic_linear_delta : float
             AIC threshold δ below which linear is preferred over a
             better-fitting model.  Default 2.0.
+        enable_bfcm_carveout : bool
+            When ``True`` (default), if the final trend segment overlaps a
+            compound holiday block window by more than
+            ``bfcm_carveout_min_overlap_days`` days, the segment trend is
+            re-fitted on the pre-compound-block sub-window only.  This
+            prevents the linear interpolation bridge created by compound
+            masking (which slopes upward through the BFCM ramp) from
+            inflating the final segment slope and producing spurious growth
+            forecasts.
+        bfcm_carveout_min_overlap_days : int
+            Minimum overlap (in days) between the final segment and any
+            compound block window before the carve-out is applied.
+            Default 30.
 
         Returns
         -------
@@ -194,6 +232,67 @@ class SeqdForecaster:
             aic_linear_delta=aic_linear_delta,
         )
 
+        # BFCM carve-out: if the final segment spans a compound holiday block
+        # window by a significant margin, re-fit the trend on only the
+        # pre-compound sub-window.  The compound masking step above linearly
+        # interpolates through each block, creating an upward-sloping bridge
+        # from the pre-BFCM level to the post-BFCM level.  When this bridge
+        # falls inside the final segment, OLS fits an inflated slope, causing
+        # over-extrapolation in the forecast horizon.
+        if enable_bfcm_carveout and len(segments) > 0:
+            final_seg = segments[-1]
+            final_seg_start = pd.Timestamp(final_seg.start_date)
+            final_seg_end = pd.Timestamp(final_seg.end_date)
+
+            # Find the latest compound block that overlaps the final segment
+            carveout_cutoff: Optional[pd.Timestamp] = None
+            for eff in self._result.holidays:
+                if eff.compound:
+                    block_start = pd.Timestamp(eff.ramp_start)
+                    block_end = pd.Timestamp(eff.ramp_end)
+                    # Check overlap with final segment
+                    overlap_start = max(final_seg_start, block_start)
+                    overlap_end = min(final_seg_end, block_end)
+                    overlap_days = (overlap_end - overlap_start).days + 1
+                    if overlap_days >= bfcm_carveout_min_overlap_days:
+                        # Use the day before the block starts as the cutoff
+                        candidate = block_start - pd.Timedelta(days=1)
+                        if carveout_cutoff is None or candidate > carveout_cutoff:
+                            carveout_cutoff = candidate
+
+            if carveout_cutoff is not None and carveout_cutoff > final_seg_start:
+                # Re-fit the final segment on the sub-window ending at carveout_cutoff
+                pre_block_residual = masked_residual.loc[
+                    final_seg_start:carveout_cutoff
+                ]
+                if len(pre_block_residual) >= 2:
+                    carveout_segments = fit_piecewise_trend(
+                        residual=pre_block_residual,
+                        changepoint_dates=[],  # no sub-changepoints for this window
+                        aic_linear_delta=aic_linear_delta,
+                    )
+                    if carveout_segments:
+                        # Replace the final segment with the carveout-fitted segment,
+                        # preserving the original segment index.
+                        carved = carveout_segments[0]
+                        segments[-1] = SegmentTrend(
+                            segment_index=final_seg.segment_index,
+                            start_date=carved.start_date,
+                            end_date=carved.end_date,
+                            n_obs=carved.n_obs,
+                            model_type=carved.model_type,
+                            alpha=carved.alpha,
+                            beta=carved.beta,
+                            gamma=carved.gamma,
+                            T_days=carved.T_days,
+                            aic=carved.aic,
+                            aic_linear=carved.aic_linear,
+                            rss=carved.rss,
+                            selected_reason=carved.selected_reason
+                            + " [bfcm_carveout]",
+                            t_anchor_date=carved.t_anchor_date,
+                        )
+
         self._changepoints = changepoint_dates
         self._segments = segments
         self._fitted = True
@@ -205,6 +304,7 @@ class SeqdForecaster:
         future_holidays: Optional[Dict[str, List[pd.Timestamp]]] = None,
         max_extrapolation_days: int = 365,
         max_holiday_merge_gap_days: int = 35,
+        ramp_half_width: int = 3,
     ) -> ForecastResult:
         """Run Stage 6: produce ``horizon``-day-ahead point forecasts.
 
@@ -226,6 +326,12 @@ class SeqdForecaster:
             grouping them into a compound proximity group for max-pooled
             ramp projection.  Should match the value used in the V1
             decomposer.  Default 35.
+        ramp_half_width : int
+            Half-width of the triangular ramp used for compound holiday
+            projection (days).  Default 3.  Increasing this spreads the
+            projected holiday lift over a wider window; decreasing it
+            concentrates the effect closer to the holiday date.  Must be
+            >= 0.
 
         Returns
         -------
@@ -291,6 +397,9 @@ class SeqdForecaster:
             future_holidays=future_holidays,
             max_holiday_merge_gap_days=max_holiday_merge_gap_days,
             trend_yoy_blend=self._trend_yoy_blend,
+            ramp_half_width=ramp_half_width,
+            ipm_max_years=self._ipm_max_years,
+            ipm_decay_halflife=self._ipm_decay_halflife,
         )
 
         # --- Combine ---
@@ -375,6 +484,10 @@ def forecast_from_result(
     slope_blend_alpha: float = 0.5,
     max_holiday_merge_gap_days: int = 35,
     trend_yoy_blend: float = 0.0,
+    ramp_half_width: int = 3,
+    ipm_max_years: int = 4,
+    enable_bfcm_carveout: bool = True,
+    ipm_decay_halflife: float = 0.0,
 ) -> ForecastResult:
     """Convenience wrapper: fit and forecast in one call.
 
@@ -390,6 +503,7 @@ def forecast_from_result(
             future_holidays=future_holidays,
             max_extrapolation_days=max_extrapolation_days,
             max_holiday_merge_gap_days=max_holiday_merge_gap_days,
+            ramp_half_width=ramp_half_width,
         )
 
     Parameters
@@ -414,6 +528,14 @@ def forecast_from_result(
         See :meth:`SeqdForecaster.predict`.  Default 35.
     trend_yoy_blend : float
         See :class:`SeqdForecaster`.  Default 0.0 (pure OLS).
+    ramp_half_width : int
+        See :meth:`SeqdForecaster.predict`.  Default 3.
+    ipm_max_years : int
+        See :class:`SeqdForecaster`.  Default 4.
+    enable_bfcm_carveout : bool
+        See :meth:`SeqdForecaster.fit`.  Default ``True``.
+    ipm_decay_halflife : float
+        See :class:`SeqdForecaster`.  Default 0.0 (uniform weights).
 
     Returns
     -------
@@ -424,16 +546,20 @@ def forecast_from_result(
             result,
             slope_blend_alpha=slope_blend_alpha,
             trend_yoy_blend=trend_yoy_blend,
+            ipm_max_years=ipm_max_years,
+            ipm_decay_halflife=ipm_decay_halflife,
         )
         .fit(
             changepoint_penalty_beta=changepoint_penalty_beta,
             min_segment_size=min_segment_size,
             aic_linear_delta=aic_linear_delta,
+            enable_bfcm_carveout=enable_bfcm_carveout,
         )
         .predict(
             horizon=horizon,
             future_holidays=future_holidays,
             max_extrapolation_days=max_extrapolation_days,
             max_holiday_merge_gap_days=max_holiday_merge_gap_days,
+            ramp_half_width=ramp_half_width,
         )
     )

@@ -1173,6 +1173,14 @@ def test_trend_yoy_blend_1_returns_trend_implied():
     The test constructs a synthetic DecompositionResult where the residual
     shows a known YoY growth ratio, then verifies that the blended IPM
     equals last_known_ipm * ratio exactly.
+
+    The implementation uses a 180-day non-compound window.  Compound dates
+    (Nov 1 – Dec 5 each year) are excluded before windowing.  The series
+    must span at least 3 years so the prior-year window falls entirely
+    within the series.  With the series starting 2021-01-01 and n=1295 days:
+      - recent 180-day non-compound window: ~2024-01-21 to 2024-07-18
+      - prior  180-day non-compound window: ~2023-01-21 to 2023-07-20
+    Setting those date ranges to 200 and 100 respectively gives ratio = 2.0.
     """
     from seqd._structures import (
         AnnualEffect, DecompositionResult, HolidayEffect, WeeklyEffect,
@@ -1180,22 +1188,20 @@ def test_trend_yoy_blend_1_returns_trend_implied():
     from seqd._forecast import _compute_ipm_projection
     import datetime
 
-    # Build a 2-year+90-day residual with known YoY growth.
-    # We want:
-    #   recent 90 days (days 395..484): mean = 200
-    #   prior 90 days (days 30..119): mean = 100
-    # So trend_yoy_ratio = 200 / 100 = 2.0.
-    # With last_known_ipm = 300, trend_implied_ipm = 300 * 2.0 = 600.
-    n = 485
-    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+    # 3-year + 200-day series so prior window is fully in-sample.
+    n = 3 * 365 + 200  # 1295 days starting 2021-01-01 → ends ~2024-07-18
+    dates = pd.date_range("2021-01-01", periods=n, freq="D")
 
-    residual_values = np.ones(n) * 150.0  # default
-    # prior window: indices max(0, n-90-365)..max(0, n-365) = 30..120
-    # set to 100
-    residual_values[30:120] = 100.0
-    # recent window: indices max(0, n-90)..end = 395..484
-    # set to 200
-    residual_values[395:] = 200.0
+    residual_values = np.ones(n) * 150.0  # neutral background
+    # Set prior non-compound window (2023-01-21 to 2023-07-20) to 100
+    # Set recent non-compound window (2024-01-21 to 2024-07-18) to 200
+    # Neither window overlaps Nov/Dec compound dates, so exclusion is clean.
+    for i, ts in enumerate(dates):
+        d = ts.date()
+        if datetime.date(2023, 1, 21) <= d <= datetime.date(2023, 7, 20):
+            residual_values[i] = 100.0
+        if datetime.date(2024, 1, 21) <= d <= datetime.date(2024, 7, 18):
+            residual_values[i] = 200.0
 
     y_series = pd.Series(residual_values, index=dates)
 
@@ -1240,14 +1246,14 @@ def test_trend_yoy_blend_1_returns_trend_implied():
             individual_peak_magnitude_reliable=True,
         )
 
-    he_2022 = make_he(2022, 250.0)  # prior year: not the last known
+    he_2022 = make_he(2022, 250.0)  # prior year
     he_2023 = make_he(2023, 300.0)  # last known IPM = 300
 
     matching = [he_2022, he_2023]
 
     # With trend_yoy_blend=1.0, result should be exactly trend-implied.
-    # residual recent (n-90..n): mean of residual_values[395:485] = 200.0
-    # residual prior (n-90-365..n-365): = residual_values[30:120] = 100.0
+    # recent 180-day non-compound mean = 200.0
+    # prior  180-day non-compound mean = 100.0
     # trend_yoy_ratio = 200.0 / 100.0 = 2.0
     # trend_implied_ipm = 300.0 * 2.0 = 600.0
     # With blend=1.0: blended = 1.0 * 600.0 + 0.0 * ols = 600.0

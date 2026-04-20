@@ -327,7 +327,7 @@ To prevent a strong linear trend from competing with Fourier harmonics in the BI
 
 $$\tilde{y}_t^{(h)} = y_t^{(h)} - \hat{\alpha}_{dt} - \hat{\beta}_{dt}\,t$$
 
-where $[\hat{\alpha}_{dt}, \hat{\beta}_{dt}]$ are OLS estimates from regressing $y_t^{(h)}$ on $[1, t]$.  This detrended series is used **only for BIC selection**; the final component fit in Section 6.3 uses the original $y_t^{(h)}$.
+where $[\hat{\alpha}_{dt}, \hat{\beta}_{dt}]$ are OLS estimates from regressing $y_t^{(h)}$ on $[1, t]$.  This detrended series is used for **both BIC selection and the final coefficient estimation** (see Section 6.3).
 
 BIC is evaluated over $K \in \{0, 1, 2, 3, 4, 5, 6\}$:
 
@@ -337,19 +337,23 @@ where $\operatorname{RSS}(K) = \sum_{t=0}^{n-1}\!\left(\tilde{y}_t^{(h)} - \hat{
 
 ### 6.3 Final Estimation
 
-Fit OLS on the original (non-detrended) $y_t^{(h)}$ with the selected $\hat{K}$:
+Fit OLS on the **linearly detrended** $\tilde{y}_t^{(h)}$ with the selected $\hat{K}$:
 
-$$\hat{\boldsymbol{\gamma}} = \left(\mathbf{X}^\top \mathbf{X}\right)^{-1} \mathbf{X}^\top \mathbf{y}^{(h)}, \qquad \hat{\boldsymbol{\gamma}} = [\hat{a}_0,\, \hat{a}_1,\, \hat{b}_1,\, \ldots,\, \hat{a}_{\hat{K}},\, \hat{b}_{\hat{K}}]^\top$$
+$$\hat{\boldsymbol{\gamma}} = \left(\mathbf{X}^\top \mathbf{X}\right)^{-1} \mathbf{X}^\top \tilde{\mathbf{y}}^{(h)}, \qquad \hat{\boldsymbol{\gamma}} = [\hat{a}_0,\, \hat{a}_1,\, \hat{b}_1,\, \ldots,\, \hat{a}_{\hat{K}},\, \hat{b}_{\hat{K}}]^\top$$
 
-The annual component (intercept excluded) is:
+**Rationale:** fitting on raw $y_t^{(h)}$ with a strong trend embeds the mean level in the intercept, producing a *fixed* seasonal amplitude that over-subtracts in early years and under-subtracts in later years.  Fitting on the linearly detrended series isolates the pure cyclical component so the Fourier coefficients represent deviations from the local trend rather than from the global mean.  This reduces residual autocorrelation at lag 364.
+
+The annual component (intercept excluded) is subtracted from the **original** (non-detrended) series to produce the final residual.  Because the intercept of the Fourier fit on the detrended series absorbs the mean of $\tilde{y}_t^{(h)}$ (not of $y_t^{(h)}$), excluding it from the removed component preserves the correct mean level:
 
 $$\hat{S}(t) = \sum_{k=1}^{\hat{K}} \left[\hat{a}_k \cos\frac{2\pi k t}{P} + \hat{b}_k \sin\frac{2\pi k t}{P}\right]$$
 
-If $\hat{K} = 0$, the annual component is identically zero; only the intercept $\hat{a}_0$ is estimated.
+If $\hat{K} = 0$, the annual component is identically zero; only the intercept $\hat{a}_0$ is estimated (and not removed).
 
 The final residual is:
 
-$$\hat{\epsilon}_t = y_t^{(h)} - \hat{S}(t) - \hat{a}_0$$
+$$\hat{\epsilon}_t = y_t^{(h)} - \hat{S}(t)$$
+
+Note: the stored `AnnualEffect.coefficients` array $[\hat{a}_0, \hat{a}_1, \hat{b}_1, \ldots]$ contains coefficients estimated on the **linearly detrended** series $\tilde{y}_t^{(h)}$.  When projecting the annual component out-of-sample, only the harmonic terms (intercept excluded) are applied.
 
 ### 6.4 Recency Amplitudes
 

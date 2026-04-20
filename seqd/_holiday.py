@@ -489,6 +489,80 @@ def _merge_overlapping(
 # ---------------------------------------------------------------------------
 
 
+def _precompute_name_stats(
+    occurrence_data: Dict[str, List[dict]],
+) -> Tuple[Dict[str, List[float]], Dict[str, float]]:
+    """Compute per-holiday-name year_magnitudes lists and OLS drift slopes.
+
+    Parameters
+    ----------
+    occurrence_data : dict
+        Mapping from holiday name to list of occurrence dicts (each with a
+        ``"magnitude"`` key), as produced by the per-holiday fitting stage.
+
+    Returns
+    -------
+    name_year_magnitudes : dict
+        Mapping from holiday name to sorted list of magnitudes (one per year).
+    name_drift : dict
+        Mapping from holiday name to OLS slope of magnitudes over year index.
+        Zero when fewer than 2 occurrences exist.
+    """
+    name_year_magnitudes: Dict[str, List[float]] = {}
+    name_drift: Dict[str, float] = {}
+    for name, occ_list in occurrence_data.items():
+        if not occ_list:
+            continue
+        sorted_occs = sorted(occ_list, key=lambda o: o["date"])
+        mags = [occ["magnitude"] for occ in sorted_occs]
+        name_year_magnitudes[name] = mags
+        if len(mags) >= 2:
+            x = np.arange(len(mags), dtype=float)
+            slope = ols_slope(x, np.array(mags, dtype=float))
+        else:
+            slope = 0.0
+        name_drift[name] = slope
+    return name_year_magnitudes, name_drift
+
+
+def _assign_compound_roles(
+    merged_effects: List[dict],
+) -> Tuple[Dict[datetime.date, dict], Dict[int, datetime.date]]:
+    """Map occurrence dates to their merged blocks and identify primary members.
+
+    A compound block's PRIMARY member is the occurrence with the earliest
+    calendar date.  Only the primary member carries the canonical block
+    ``effect_series`` (mean of all constituents); non-primary members receive
+    a zero series to prevent double-counting in ``holiday_component()``.
+
+    Parameters
+    ----------
+    merged_effects : list of dict
+        Merged block dicts from ``_merge_overlapping``.
+
+    Returns
+    -------
+    date_to_merged : dict
+        Mapping from each original occurrence date to its containing merged block.
+    block_primary_date : dict
+        Mapping from ``id(block)`` to the primary (earliest) occurrence date for
+        compound blocks (blocks with ``len(merged_from) > 1``).  Non-compound
+        blocks are absent from this dict.
+    """
+    date_to_merged: Dict[datetime.date, dict] = {}
+    for block in merged_effects:
+        for src in block["merged_from"]:
+            date_to_merged[src["date"]] = block
+
+    block_primary_date: Dict[int, datetime.date] = {}
+    for block in merged_effects:
+        if len(block["merged_from"]) > 1:
+            earliest = min(src["date"] for src in block["merged_from"])
+            block_primary_date[id(block)] = earliest
+
+    return date_to_merged, block_primary_date
+
+
 def _build_holiday_effects(
     occurrence_data: Dict[str, List[dict]],
     merged_effects: List[dict],
@@ -505,48 +579,23 @@ def _build_holiday_effects(
     that holiday_component() has non-zero values across *all* years, not just the
     most recent one.  year_magnitudes on each HolidayEffect lists the magnitudes
     of all occurrences of the same holiday name (for drift tracking).
+
+    Delegates to:
+    - :func:`_precompute_name_stats` — per-holiday year_magnitudes and drift slopes.
+    - :func:`_assign_compound_roles` — maps occurrence dates to merged blocks and
+      identifies primary compound-block members.
     """
     result = []
 
-    # Map each original occurrence date to its merged block
-    date_to_merged: Dict[datetime.date, dict] = {}
+    # Build date→block map and compound primary-date map
+    date_to_merged, block_primary_date = _assign_compound_roles(merged_effects)
+
     # Also build a block -> compound_block_id mapping (assigned on first encounter)
     block_to_id: Dict[int, str] = {}
     block_counter = [0]
 
-    for block in merged_effects:
-        for src in block["merged_from"]:
-            date_to_merged[src["date"]] = block
-
-    # Precompute per-name year_magnitudes and drift slopes so each occurrence can
-    # carry the full recency list from its holiday name group.
-    name_year_magnitudes: Dict[str, List[float]] = {}
-    name_drift: Dict[str, float] = {}
-    for name, occ_list in occurrence_data.items():
-        if not occ_list:
-            continue
-        sorted_occs = sorted(occ_list, key=lambda o: o["date"])
-        mags = [occ["magnitude"] for occ in sorted_occs]
-        name_year_magnitudes[name] = mags
-        if len(mags) >= 2:
-            x = np.arange(len(mags), dtype=float)
-            slope = ols_slope(x, np.array(mags, dtype=float))
-        else:
-            slope = 0.0
-        name_drift[name] = slope
-
-    # For each compound block, designate the PRIMARY member (earliest holiday date)
-    # as the sole carrier of the canonical block effect_series.  All other members
-    # receive a zero effect_series.  This ensures holiday_component() sums to
-    # exactly one copy of the canonical effect per block — no double-counting.
-    #
-    # block["effect_series"] is now the MEAN of constituent effects (set in
-    # _merge_overlapping), so it is already the canonical per-block estimate.
-    block_primary_date: Dict[int, datetime.date] = {}
-    for block in merged_effects:
-        if len(block["merged_from"]) > 1:
-            earliest = min(src["date"] for src in block["merged_from"])
-            block_primary_date[id(block)] = earliest
+    # Precompute per-name year_magnitudes and drift slopes
+    name_year_magnitudes, name_drift = _precompute_name_stats(occurrence_data)
 
     # Build one HolidayEffect per occurrence
     for name, occ_list in occurrence_data.items():

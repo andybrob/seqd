@@ -83,6 +83,11 @@ class SeqdDecomposer:
         Default 7.  Thanksgiving + Black Friday (gap=1) and Black Friday + Cyber
         Monday (gap=3) will merge; Cyber Monday + Christmas (gap=25) will not.
         This criterion is independent of ``holiday_window`` size.
+    max_harmonics : int
+        Upper bound on the number of Fourier harmonics considered during BIC
+        selection for annual seasonality.  BIC searches K ∈ {0, ..., max_harmonics}.
+        Default 6.  Reducing this prevents over-fitting on short or sparse series.
+        Must be >= 0.
     """
 
     def __init__(
@@ -96,13 +101,36 @@ class SeqdDecomposer:
         max_holiday_window: Optional[int] = None,
         reference_window: int = 60,
         max_holiday_merge_gap_days: int = 7,
+        max_harmonics: int = 6,
     ) -> None:
+        if holiday_window < 1:
+            raise ValueError(
+                f"holiday_window must be >= 1 (got {holiday_window})."
+            )
+        if max_holiday_window is not None and max_holiday_window < 1:
+            raise ValueError(
+                f"max_holiday_window must be >= 1 (got {max_holiday_window})."
+            )
+        if reference_window < 1:
+            raise ValueError(
+                f"reference_window must be >= 1 (got {reference_window})."
+            )
+        if max_holiday_merge_gap_days < 0:
+            raise ValueError(
+                f"max_holiday_merge_gap_days must be >= 0 "
+                f"(got {max_holiday_merge_gap_days})."
+            )
+        if max_harmonics < 0:
+            raise ValueError(
+                f"max_harmonics must be >= 0 (got {max_harmonics})."
+            )
         self.holidays = normalize_holiday_input(holiday_dates)
         self.multiplicative = multiplicative
         self.holiday_window = holiday_window
         self.max_holiday_window = max_holiday_window
         self.reference_window = reference_window
         self.max_holiday_merge_gap_days = max_holiday_merge_gap_days
+        self.max_harmonics = max_harmonics
 
     def fit(self, y: pd.Series) -> DecompositionResult:
         """Fit the decomposition on the input series.
@@ -184,7 +212,7 @@ class SeqdDecomposer:
         )
 
         # Stage 3: Annual
-        annual_effect, y_clean = fit_annual(y_h=y_h)
+        annual_effect, y_clean = fit_annual(y_h=y_h, max_harmonics=self.max_harmonics)
 
         # Compute R² by component using marginal (sequential) contribution.
         #

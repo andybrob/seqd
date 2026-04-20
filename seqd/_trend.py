@@ -281,6 +281,11 @@ def fit_piecewise_trend(
     list of SegmentTrend
         One record per segment, ordered by ``segment_index`` (1-based).
     """
+    if aic_linear_delta < 0:
+        raise ValueError(
+            f"aic_linear_delta must be >= 0 (got {aic_linear_delta})."
+        )
+
     r_full = residual.dropna().copy().astype(float)
     idx = r_full.index
     n = len(r_full)

@@ -18,13 +18,21 @@ from ._utils import ols_fit
 PERIOD = 365.25
 
 
-def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
+def fit_annual(
+    y_h: pd.Series,
+    max_harmonics: int = 6,
+) -> Tuple[AnnualEffect, pd.Series]:
     """Fit and remove annual Fourier seasonality.
 
     Parameters
     ----------
     y_h : pd.Series
         Holiday-adjusted series with DatetimeIndex.
+    max_harmonics : int
+        Upper bound on the number of Fourier harmonics considered during BIC
+        selection.  BIC searches K ∈ {0, 1, ..., max_harmonics}.  Default 6.
+        Reducing this (e.g. to 3 or 4) can prevent over-fitting on short
+        series or series with sparse annual coverage.  Must be >= 0.
 
     Returns
     -------
@@ -32,6 +40,11 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     y_clean : pd.Series
         Series with annual effect removed.
     """
+    if max_harmonics < 0:
+        raise ValueError(
+            f"max_harmonics must be >= 0 (got {max_harmonics})."
+        )
+
     y_h = y_h.copy().astype(float)
     idx = y_h.index
     n = len(y_h)
@@ -50,7 +63,7 @@ def fit_annual(y_h: pd.Series) -> Tuple[AnnualEffect, pd.Series]:
     # K=0 (intercept only) is included so that a series with no annual
     # seasonality is not forced to absorb a spurious Fourier harmonic.
     best_K, best_bic = 0, np.inf
-    for K in range(0, 7):
+    for K in range(0, max_harmonics + 1):
         if K == 0:
             X = np.ones((n, 1))
             n_params = 1

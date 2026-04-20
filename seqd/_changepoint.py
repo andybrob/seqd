@@ -54,6 +54,15 @@ def detect_changepoints(
         Emitted when the series is too short for changepoints, when variance
         is near-zero, or when the series allows very few segments.
     """
+    if penalty_beta <= 0:
+        raise ValueError(
+            f"penalty_beta must be > 0 (got {penalty_beta})."
+        )
+    if min_size < 2:
+        raise ValueError(
+            f"min_size must be >= 2 (got {min_size})."
+        )
+
     r_t = residual.dropna().copy().astype(float)
     n = len(r_t)
 

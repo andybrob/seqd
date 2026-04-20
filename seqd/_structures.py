@@ -208,12 +208,21 @@ class AnnualEffect:
     n_harmonics : int
         Number of Fourier harmonics selected by BIC. K ∈ {0,1,...,6}.
     coefficients : np.ndarray
-        Fourier coefficients [a0, a1, b1, a2, b2, ...] where a0 is the intercept.
+        Fourier coefficients [a0, a1, b1, a2, b2, ...] where a0 is the
+        intercept.  **Important:** these are estimated on the linearly
+        detrended series $\tilde{y}_t^{(h)}$, not on the raw
+        holiday-adjusted series $y_t^{(h)}$.  Consequently the intercept
+        a0 is the mean of the detrended residual (approximately zero for a
+        zero-mean cyclical component) rather than the overall level of the
+        series.  Only the harmonic terms (a1, b1, a2, b2, ...) are used
+        when computing the ``component`` series and when projecting
+        out-of-sample via ``_project_annual()``.
     component : pd.Series
         Fitted annual component aligned to original index (intercept excluded).
     recency_amplitudes : dict
         Mapping from years (1, 2, 3) to amplitude sqrt(a1^2 + b1^2) estimated
-        on that trailing window.
+        on that trailing window.  Each window is linearly detrended before
+        fitting.
     """
 
     n_harmonics: int

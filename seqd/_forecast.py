@@ -274,6 +274,18 @@ def _project_weekly(
                     break
 
     if dow_coeffs is None:
+        # None of the recency windows (60, 90, 365) had valid data — fall back
+        # to the full-sample weekly coefficients.  This can happen when the
+        # V1 series is shorter than 60 days or when recency tracking was
+        # unavailable.  The full-sample coefficients may be stale if DOW
+        # effects have drifted recently.
+        warnings.warn(
+            "No recency window (60, 90, or 365 days) returned valid weekly "
+            "coefficients. Falling back to full-sample coefficients. "
+            "Weekly forecast may not reflect recent DOW pattern shifts.",
+            UserWarning,
+            stacklevel=3,
+        )
         dow_coeffs = result.weekly.coefficients.copy()
 
     # Map forecast dates to DOW (Monday=0)
@@ -335,12 +347,22 @@ def _project_annual(
 # ---------------------------------------------------------------------------
 
 
-def _ols_project_ipm(ipm_pairs: List[tuple], max_years: int = 4) -> float:
-    """Project next IPM from a list of (year, magnitude) pairs using OLS.
+def _ols_project_ipm(
+    ipm_pairs: List[tuple],
+    max_years: int = 4,
+    exponential_decay_halflife_years: float = 0.0,
+) -> float:
+    """Project next IPM from a list of (year, magnitude) pairs using WLS.
 
     Uses only the most recent ``max_years`` data points (recency weighting by
     truncation).  This prevents over-projection on concave growth series where
     early high-growth years inflate the OLS slope.
+
+    Optionally applies exponential down-weighting of older observations via
+    ``exponential_decay_halflife_years``.  Weights are
+    ``w_i = 2^(-(distance_from_most_recent / halflife))``, so the most-recent
+    observation always has weight 1.0.  When ``halflife == 0`` (default) all
+    within-window observations receive equal weight (standard OLS).
 
     If the projected IPM implies >40% YoY growth from the most recent known
     IPM, the projection is capped at 40% above the most recent value.
@@ -349,7 +371,11 @@ def _ols_project_ipm(ipm_pairs: List[tuple], max_years: int = 4) -> float:
     ----------
     ipm_pairs : list of (year_index, magnitude) tuples, sorted by year.
     max_years : int
-        Maximum number of most-recent years to use for OLS.  Default 4.
+        Maximum number of most-recent years to use.  Default 4.
+    exponential_decay_halflife_years : float
+        Exponential decay half-life in years.  0.0 = uniform weights
+        (backward-compatible).  Values in (0, 2] provide meaningful
+        down-weighting of older points.
 
     Returns
     -------
@@ -372,13 +398,24 @@ def _ols_project_ipm(ipm_pairs: List[tuple], max_years: int = 4) -> float:
     if len(recent_pairs) == 1:
         projected = float(y_arr[0])
     else:
-        xm = x_arr.mean()
-        ym = y_arr.mean()
-        denom = np.sum((x_arr - xm) ** 2)
+        # Build observation weights
+        if exponential_decay_halflife_years > 0.0:
+            # Distance from most-recent observation (index 0 = oldest in window)
+            distances = x_arr[-1] - x_arr  # 0 at most-recent
+            w_arr = np.power(2.0, -distances / exponential_decay_halflife_years)
+        else:
+            w_arr = np.ones(len(x_arr))
+
+        # Weighted OLS: slope = sum(w*(x-xw)*(y-yw)) / sum(w*(x-xw)^2)
+        w_sum = w_arr.sum()
+        xw = float(np.dot(w_arr, x_arr) / w_sum)
+        yw = float(np.dot(w_arr, y_arr) / w_sum)
+        wx_dev = w_arr * (x_arr - xw)
+        denom = float(np.dot(wx_dev, x_arr - xw))
         if denom == 0.0:
             slope = 0.0
         else:
-            slope = float(np.sum((x_arr - xm) * (y_arr - ym)) / denom)
+            slope = float(np.dot(wx_dev, y_arr - yw) / denom)
         # Project to the next year index (last x + 1)
         projected = float(y_arr[-1]) + slope
 
@@ -403,14 +440,18 @@ def _trend_linked_ipm(
     in recent months, BFCM magnitude should also grow ~5% — not the (often
     larger) linear extrapolation from historical IPM growth.
 
-    The de-seasonalized YoY growth rate is estimated from the V1 residual:
-    the residual already has weekly, holiday, and annual components removed,
-    so its mean is a clean estimate of the underlying trend level.
+    The de-seasonalized YoY growth rate is estimated from the V1 residual
+    **excluding all compound block windows**.  Using the raw trailing 90-day
+    window would straddle the BFCM period for series ending in Q4, making the
+    YoY ratio ≈ 1.0 (holiday vs. holiday) and defeating the purpose of the
+    blending.  By excluding compound-block dates and using a wider 180-day
+    non-compound window, the ratio accurately captures structural business
+    growth rather than holiday seasonality noise.
 
     Parameters
     ----------
     result : DecompositionResult
-        V1 decomposition result (provides residual series).
+        V1 decomposition result (provides residual series and holiday effects).
     projected_ipm_ols : float
         OLS-based IPM projection (from ``_ols_project_ipm``).
     last_known_ipm : float
@@ -428,22 +469,63 @@ def _trend_linked_ipm(
         return projected_ipm_ols
 
     residual = result.residual
-    n = len(residual)
 
-    # Recent 90-day window and same window one year prior
-    recent = residual.iloc[max(0, n - 90):]
-    prior = residual.iloc[max(0, n - 90 - 365):max(0, n - 365)]
+    # Build compound-block exclusion set: all dates inside any compound
+    # holiday ramp window across all years.  These dates contain the
+    # holiday lift in the residual and would bias the YoY ratio if included.
+    compound_dates: set = set()
+    for eff in result.holidays:
+        if eff.compound:
+            ramp_start = pd.Timestamp(eff.ramp_start).date()
+            ramp_end = pd.Timestamp(eff.ramp_end).date()
+            d = ramp_start
+            while d <= ramp_end:
+                compound_dates.add(d)
+                d += _dt.timedelta(days=1)
 
-    if len(recent) < 30 or len(prior) < 30:
+    # Filter residual to non-compound dates only
+    non_compound_residual = residual[
+        ~residual.index.map(lambda ts: ts.date() in compound_dates)
+    ]
+
+    if len(non_compound_residual) < 90:
+        return projected_ipm_ols  # not enough non-compound data
+
+    n_nc = len(non_compound_residual)
+
+    # Recent 180-day (non-compound) window and same window one year prior.
+    # 180-day window is used (vs. the former 90-day) because excluding
+    # compound-block dates reduces the effective sample; 180 days gives
+    # ~130-150 non-compound observations, safely above the 30-obs threshold.
+    window_size = 180
+    recent_nc = non_compound_residual.iloc[max(0, n_nc - window_size):]
+
+    # One-year-prior window: same calendar span shifted back ~365 days.
+    # We identify the prior window by date range rather than positional
+    # offset, because compound-date exclusion makes the positional mapping
+    # non-trivial.
+    if len(recent_nc) == 0:
+        return projected_ipm_ols
+
+    recent_start = recent_nc.index[0]
+    prior_end = recent_start - pd.Timedelta(days=365 - window_size)
+    prior_start = prior_end - pd.Timedelta(days=window_size)
+
+    prior_nc = non_compound_residual[
+        (non_compound_residual.index >= prior_start)
+        & (non_compound_residual.index <= prior_end)
+    ]
+
+    if len(recent_nc) < 30 or len(prior_nc) < 30:
         return projected_ipm_ols  # not enough data for trend estimate
 
-    recent_mean = recent.mean()
-    prior_mean = prior.mean()
+    recent_mean = recent_nc.mean()
+    prior_mean = prior_nc.mean()
 
     if prior_mean <= 0:
         return projected_ipm_ols
 
-    # De-seasonalized YoY growth from recent trend
+    # De-seasonalized YoY growth from recent (non-compound) trend
     trend_yoy_ratio = recent_mean / prior_mean
     trend_implied_ipm = last_known_ipm * trend_yoy_ratio
 
@@ -457,6 +539,8 @@ def _compute_ipm_projection(
     matching,
     result: Optional["DecompositionResult"] = None,
     trend_yoy_blend: float = 0.0,
+    ipm_max_years: int = 4,
+    ipm_decay_halflife: float = 0.0,
 ) -> float:
     """Compute projected IPM for a compound holiday from its historical occurrences.
 
@@ -473,6 +557,13 @@ def _compute_ipm_projection(
     trend_yoy_blend : float
         Weight on the trend-growth-implied IPM projection (see
         ``_trend_linked_ipm``).  Default 0.0 (pure OLS, backward-compatible).
+    ipm_max_years : int
+        Maximum number of most-recent historical years to include in the
+        OLS fit.  Passed directly to ``_ols_project_ipm``.  Default 4.
+    ipm_decay_halflife : float
+        Exponential decay half-life in years for down-weighting older IPM
+        observations.  0.0 = uniform weights.  Passed to
+        ``_ols_project_ipm``.  Default 0.0.
 
     Returns
     -------
@@ -490,7 +581,11 @@ def _compute_ipm_projection(
 
     n_reliable = len(ipm_pairs)
     if n_reliable >= 2:
-        projected_ipm = _ols_project_ipm(ipm_pairs)
+        projected_ipm = _ols_project_ipm(
+            ipm_pairs,
+            max_years=ipm_max_years,
+            exponential_decay_halflife_years=ipm_decay_halflife,
+        )
     elif n_reliable == 1:
         projected_ipm = float(ipm_pairs[0][1])
     else:
@@ -543,20 +638,41 @@ def _triangular_ramp_contribution(
     forecast_date_set: Dict["_dt.date", int],
     min_fc_date: "_dt.date",
     max_fc_date: "_dt.date",
+    ramp_half_width: int = 3,
 ) -> Dict["_dt.date", float]:
     """Compute triangular ramp contributions for a single holiday occurrence.
 
     Returns a dict mapping forecast date → contribution value for all days
-    within ±3 days of h_date that fall in the forecast window.
+    within ``±ramp_half_width`` days of h_date that fall in the forecast
+    window.  The triangular weight is:
+
+        weight = max(0, 1 - |day_delta| / (ramp_half_width + 1))
+
+    so that the peak weight at day_delta=0 is 1.0 and the weight at
+    ±ramp_half_width is 1 / (ramp_half_width + 1) > 0.
+
+    Parameters
+    ----------
+    h_date : datetime.date
+        The holiday date.
+    projected_ipm : float
+        Projected individual peak magnitude for this occurrence.
+    forecast_date_set : dict
+        Mapping from date → forecast array index.
+    min_fc_date, max_fc_date : datetime.date
+        Forecast window boundaries (inclusive).
+    ramp_half_width : int
+        Half-width of the triangular ramp in days.  Default 3.
     """
     contribs: Dict["_dt.date", float] = {}
-    for day_delta in range(-3, 4):
+    divisor = float(ramp_half_width + 1)
+    for day_delta in range(-ramp_half_width, ramp_half_width + 1):
         eff_date = h_date + _dt.timedelta(days=day_delta)
         if eff_date < min_fc_date or eff_date > max_fc_date:
             continue
         if eff_date not in forecast_date_set:
             continue
-        weight = max(0.0, 1.0 - abs(day_delta) / 4.0)
+        weight = max(0.0, 1.0 - abs(day_delta) / divisor)
         contribs[eff_date] = projected_ipm * weight
     return contribs
 
@@ -622,12 +738,15 @@ def _project_holidays(
     future_holidays: Dict[str, List[pd.Timestamp]],
     max_holiday_merge_gap_days: int = 35,
     trend_yoy_blend: float = 0.0,
+    ramp_half_width: int = 3,
+    ipm_max_years: int = 4,
+    ipm_decay_halflife: float = 0.0,
 ) -> np.ndarray:
     """Project holiday effects onto forecast dates.
 
     For **compound block members** the projection uses
-    ``individual_peak_magnitude`` (IPM) and a triangular ramp (±3 days)
-    centred on the holiday date.
+    ``individual_peak_magnitude`` (IPM) and a triangular ramp of
+    ``±ramp_half_width`` days centred on the holiday date.
 
     **Compound ramp max-pooling** (Fix A): when multiple future holidays fall
     within ``max_holiday_merge_gap_days`` days of each other, their triangular
@@ -653,6 +772,15 @@ def _project_holidays(
     trend_yoy_blend : float
         Weight on trend-growth-implied IPM projection (see
         ``_trend_linked_ipm``).  Default 0.0 (pure OLS, backward-compatible).
+    ramp_half_width : int
+        Half-width of the triangular ramp used for compound holiday
+        projection (days).  Default 3.
+    ipm_max_years : int
+        Maximum number of most-recent historical years used for OLS IPM
+        projection.  Default 4.  Passed to ``_compute_ipm_projection``.
+    ipm_decay_halflife : float
+        Exponential decay half-life in years for down-weighting older IPM
+        observations in the OLS fit.  0.0 = uniform weights (default).
 
     Returns
     -------
@@ -695,7 +823,8 @@ def _project_holidays(
         for h_name in compound_future:
             matching = [he for he in result.holidays if he.name == h_name]
             projected_ipms[h_name] = _compute_ipm_projection(
-                h_name, matching, result=result, trend_yoy_blend=trend_yoy_blend
+                h_name, matching, result=result, trend_yoy_blend=trend_yoy_blend,
+                ipm_max_years=ipm_max_years, ipm_decay_halflife=ipm_decay_halflife,
             )
 
         # Group future holidays by date proximity
@@ -709,7 +838,8 @@ def _project_holidays(
                 h_name, h_date = group[0]
                 ipm = projected_ipms[h_name]
                 for eff_date, contrib in _triangular_ramp_contribution(
-                    h_date, ipm, forecast_date_set, min_fc_date, max_fc_date
+                    h_date, ipm, forecast_date_set, min_fc_date, max_fc_date,
+                    ramp_half_width=ramp_half_width,
                 ).items():
                     holiday_array[forecast_date_set[eff_date]] += contrib
             else:
@@ -720,7 +850,8 @@ def _project_holidays(
                 for h_name, h_date in group:
                     ipm = projected_ipms[h_name]
                     for eff_date, contrib in _triangular_ramp_contribution(
-                        h_date, ipm, forecast_date_set, min_fc_date, max_fc_date
+                        h_date, ipm, forecast_date_set, min_fc_date, max_fc_date,
+                        ramp_half_width=ramp_half_width,
                     ).items():
                         if eff_date not in date_contributions:
                             date_contributions[eff_date] = []
