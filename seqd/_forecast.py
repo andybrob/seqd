@@ -19,16 +19,86 @@ PERIOD = 365.25  # annual period in days (matches _annual.py)
 # ---------------------------------------------------------------------------
 
 
+def _slope_at_t1_per_day(segment: SegmentTrend) -> float:
+    """Return the slope of ``segment`` at t=1, in units of value/day.
+
+    The SegmentTrend parameters are in normalised t-space [0, 1].
+    Converting to per-day units requires dividing by (n_obs - 1).
+
+    Model-specific derivatives at t=1:
+
+    - linear:     ``beta / (n_obs - 1)``
+    - log:        ``beta * T_days / (1 + 1.0 * T_days) / (n_obs - 1)``
+    - exp:        ``alpha * beta * exp(beta) / (n_obs - 1)``
+    - quadratic:  ``(beta + 2 * gamma) / (n_obs - 1)``
+    - constant:   0.0
+
+    Parameters
+    ----------
+    segment : SegmentTrend
+        A fitted segment.
+
+    Returns
+    -------
+    float
+        Slope in value-per-day units.
+    """
+    n_j = segment.n_obs
+    if n_j <= 1:
+        return 0.0
+
+    denom = float(n_j - 1)
+    model = segment.model_type
+
+    if model == "linear":
+        return segment.beta / denom
+
+    if model == "log":
+        T = float(segment.T_days)
+        # d/dt [beta * ln(1 + t * T)] at t=1 = beta * T / (1 + T)
+        # in normalised t-space, then divide by (n_j - 1) for per-day units
+        slope_norm = segment.beta * T / (1.0 + T)
+        return slope_norm / denom
+
+    if model == "exp":
+        # d/dt [alpha * exp(beta * t)] at t=1 = alpha * beta * exp(beta)
+        slope_norm = segment.alpha * segment.beta * np.exp(segment.beta)
+        return slope_norm / denom
+
+    if model == "quadratic":
+        gamma = segment.gamma if segment.gamma is not None else 0.0
+        # d/dt [alpha + beta*t + gamma*t^2] at t=1 = beta + 2*gamma
+        slope_norm = segment.beta + 2.0 * gamma
+        return slope_norm / denom
+
+    # constant or unknown
+    return 0.0
+
+
 def _project_trend(
     last_segment: SegmentTrend,
     horizon: int,
     max_extrapolation_days: int,
+    penultimate_segment: Optional["SegmentTrend"] = None,
+    slope_blend_alpha: float = 0.0,
 ) -> tuple[np.ndarray, List[str]]:
     """Project the last segment's trend forward for ``horizon`` days.
 
-    The normalised time coordinate is extended beyond the in-sample range:
-    ``t=0`` maps to the segment start, ``t=1`` maps to the last in-sample
-    day, and ``t > 1`` covers the forecast steps.
+    **Blended linear extrapolation** (H1 fix):
+
+    When ``penultimate_segment`` is provided and ``slope_blend_alpha > 0``,
+    the extrapolation slope is blended between the penultimate and final
+    segment slopes (both at t=1 in their own coordinate systems):
+
+        blended_slope = alpha * slope_penultimate + (1 - alpha) * slope_final
+
+    The trend is then projected as a linear continuation from the final
+    segment's end value using the blended slope:
+
+        trend[i] = baseline + blended_slope * (i + 1)   for i = 0, 1, ..., horizon-1
+
+    where ``baseline = segment.predict(t=1)``.  This replaces the previous
+    model-based quadratic/exp clamping for extrapolation.
 
     Parameters
     ----------
@@ -38,6 +108,13 @@ def _project_trend(
         Number of forecast steps.
     max_extrapolation_days : int
         Warn if horizon exceeds this value.
+    penultimate_segment : SegmentTrend or None
+        The second-to-last segment.  When provided and
+        ``slope_blend_alpha > 0``, enables blended linear extrapolation.
+    slope_blend_alpha : float
+        Weight on penultimate slope (0.0 = use final slope only;
+        1.0 = use penultimate slope only).  Default 0.0 (no blending,
+        backward-compatible with old clamping behaviour).
 
     Returns
     -------
@@ -58,6 +135,36 @@ def _project_trend(
         warnings.warn(msg, UserWarning, stacklevel=4)
         emitted_warnings.append(msg)
 
+    # Edge case: single-observation last segment → constant extrapolation
+    if n_j <= 1:
+        return np.full(horizon, last_segment.alpha), emitted_warnings
+
+    # -------------------------------------------------------------------
+    # H1: Blended linear extrapolation
+    # -------------------------------------------------------------------
+    # When slope blending is active (alpha > 0 and penultimate segment
+    # exists), replace the model-based extrapolation entirely with a
+    # linear continuation using the blended slope.  This prevents the
+    # Q4-contaminated final segment slope from driving catastrophic
+    # overforecasts in BFCM cutoffs.
+    if slope_blend_alpha > 0.0 and penultimate_segment is not None:
+        slope_final = _slope_at_t1_per_day(last_segment)
+        slope_penult = _slope_at_t1_per_day(penultimate_segment)
+        blended_slope = slope_blend_alpha * slope_penult + (1.0 - slope_blend_alpha) * slope_final
+
+        # Baseline: value of last segment at t=1 (the segment end)
+        baseline = evaluate_segment(last_segment, 1.0)
+
+        # Linear extrapolation: day 1, 2, ..., horizon beyond series end
+        trend_array = np.array(
+            [baseline + blended_slope * (i + 1) for i in range(horizon)],
+            dtype=float,
+        )
+        return trend_array, emitted_warnings
+
+    # -------------------------------------------------------------------
+    # Legacy path: model-based extrapolation with clamping (alpha == 0)
+    # -------------------------------------------------------------------
     if last_segment.model_type == "exp" and last_segment.beta > 0 and horizon > n_j:
         msg = (
             "Last segment model is 'exp' with positive beta and horizon "
@@ -81,10 +188,6 @@ def _project_trend(
             )
             warnings.warn(msg, UserWarning, stacklevel=4)
             emitted_warnings.append(msg)
-
-    # Edge case: single-observation last segment → constant extrapolation
-    if n_j <= 1:
-        return np.full(horizon, last_segment.alpha), emitted_warnings
 
     # t_h = ((n_j - 1) + h) / (n_j - 1) for h = 1..horizon
     denom = float(n_j - 1)

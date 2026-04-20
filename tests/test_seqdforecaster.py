@@ -621,3 +621,260 @@ def test_forecast_result_warnings_populated_on_quadratic_overextension():
             "Quadratic overextension should produce a non-empty warnings list"
         )
         assert any("quadratic" in w.lower() for w in fr.warnings)
+
+
+# ---------------------------------------------------------------------------
+# H1: Slope blending
+# ---------------------------------------------------------------------------
+
+
+def test_slope_blend_alpha_invalid_raises():
+    """slope_blend_alpha outside [0, 1] should raise ValueError."""
+    result, _ = make_decomposition()
+    with pytest.raises(ValueError, match="slope_blend_alpha"):
+        SeqdForecaster(result, slope_blend_alpha=1.5)
+    with pytest.raises(ValueError, match="slope_blend_alpha"):
+        SeqdForecaster(result, slope_blend_alpha=-0.1)
+
+
+def test_slope_blend_alpha_zero_is_default():
+    """slope_blend_alpha=0.0 should produce the same forecast as no blending."""
+    result, _ = make_decomposition()
+    fr_default = SeqdForecaster(result).fit().predict(horizon=60)
+    fr_zero = SeqdForecaster(result, slope_blend_alpha=0.0).fit().predict(horizon=60)
+    np.testing.assert_allclose(
+        fr_default.trend_component.values,
+        fr_zero.trend_component.values,
+        rtol=1e-12,
+    )
+
+
+def test_slope_blend_alpha_produces_finite_forecast():
+    """Blended slope extrapolation must produce finite values for all model types."""
+    result, _ = make_decomposition()
+    fr = SeqdForecaster(result, slope_blend_alpha=0.3).fit().predict(horizon=180)
+    assert np.all(np.isfinite(fr.forecast.values)), "Blended forecast must be finite"
+    assert np.all(np.isfinite(fr.trend_component.values)), "Blended trend must be finite"
+
+
+def test_slope_blend_dampens_steep_final_slope():
+    """With a steep final segment and a flat penultimate, blending should
+    produce a lower projected trend than pure final-segment extrapolation.
+
+    Construct a two-segment synthetic residual where:
+    - Segment 1 (penultimate): flat ~ 100
+    - Segment 2 (final): steeply rising (Q4-like ramp)
+
+    With alpha=0.3, the blended slope should be less steep than the final
+    segment's slope alone, so the 90-day forecast should be lower than the
+    alpha=0.0 forecast.
+    """
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, WeeklyEffect
+    )
+
+    rng = np.random.default_rng(555)
+    n_flat = 300
+    n_steep = 120
+    n = n_flat + n_steep
+    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+
+    t_flat = np.arange(n_flat, dtype=float)
+    t_steep = np.arange(n_steep, dtype=float)
+
+    # Flat segment: ~100, tiny noise
+    y_flat = 100.0 + rng.normal(0, 0.5, n_flat)
+    # Steep segment: starts at 100, ends at 200 (slope ~0.83/day)
+    y_steep = 100.0 + (100.0 / (n_steep - 1)) * t_steep + rng.normal(0, 0.5, n_steep)
+
+    y_values = np.concatenate([y_flat, y_steep])
+    y_series = pd.Series(y_values, index=dates)
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=[],
+        annual=annual,
+        residual=y_series.copy(),
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fr_pure = SeqdForecaster(result, slope_blend_alpha=0.0).fit(
+            min_segment_size=60
+        ).predict(horizon=90)
+        fr_blended = SeqdForecaster(result, slope_blend_alpha=0.3).fit(
+            min_segment_size=60
+        ).predict(horizon=90)
+
+    # Blended forecast should be lower (less steep extrapolation) when
+    # the penultimate segment is flat and final is steep.
+    # Only assert this if two segments were detected.
+    n_segs_pure = len(fr_pure.segments)
+    n_segs_blended = len(fr_blended.segments)
+    if n_segs_blended >= 2:
+        mean_pure = fr_pure.trend_component.values.mean()
+        mean_blended = fr_blended.trend_component.values.mean()
+        assert mean_blended < mean_pure, (
+            f"Blended forecast should be lower than pure-final when penultimate "
+            f"is flat: blended_mean={mean_blended:.2f}, pure_mean={mean_pure:.2f}"
+        )
+
+
+def test_slope_blend_single_segment_unaffected():
+    """With only one segment, blending is a no-op (no penultimate available)."""
+    from seqd._structures import (
+        AnnualEffect, DecompositionResult, WeeklyEffect
+    )
+
+    rng = np.random.default_rng(77)
+    n = 200
+    dates = pd.date_range("2022-01-01", periods=n, freq="D")
+    t = np.arange(n, dtype=float)
+    y_values = 100.0 + 0.05 * t + rng.normal(0, 0.5, n)
+    y_series = pd.Series(y_values, index=dates)
+
+    annual = AnnualEffect(
+        n_harmonics=0,
+        coefficients=np.array([0.0]),
+        component=pd.Series(0.0, index=dates),
+    )
+    weekly = WeeklyEffect(
+        coefficients=np.ones(7),
+        is_multiplicative=False,
+        recency={},
+        drift={},
+    )
+    result = DecompositionResult(
+        series=y_series,
+        weekly=weekly,
+        holidays=[],
+        annual=annual,
+        residual=y_series.copy(),
+        r2_by_component={"weekly": 0.0, "holiday": 0.0, "annual": 0.0},
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fr_alpha0 = SeqdForecaster(result, slope_blend_alpha=0.0).fit(
+            min_segment_size=180
+        ).predict(horizon=30)
+        fr_alpha03 = SeqdForecaster(result, slope_blend_alpha=0.3).fit(
+            min_segment_size=180
+        ).predict(horizon=30)
+
+    # If single segment was detected, both forecasts must be identical
+    if len(fr_alpha0.segments) == 1 and len(fr_alpha03.segments) == 1:
+        np.testing.assert_allclose(
+            fr_alpha0.trend_component.values,
+            fr_alpha03.trend_component.values,
+            rtol=1e-12,
+            err_msg="Single-segment blending should be identical to alpha=0",
+        )
+
+
+def test_forecast_from_result_slope_blend_alpha():
+    """forecast_from_result should pass slope_blend_alpha through correctly."""
+    result, _ = make_decomposition(seed=42)
+    fr = forecast_from_result(result, horizon=60, slope_blend_alpha=0.3)
+    assert len(fr.forecast) == 60
+    assert np.all(np.isfinite(fr.forecast.values))
+
+
+def test_slope_blend_alpha_property_stored():
+    """SeqdForecaster should store slope_blend_alpha and use it in both predict calls."""
+    result, _ = make_decomposition()
+    forecaster = SeqdForecaster(result, slope_blend_alpha=0.3)
+    assert forecaster._slope_blend_alpha == 0.3
+    # Both predict calls from the same fitted forecaster must give same trend
+    forecaster.fit()
+    fr1 = forecaster.predict(horizon=30)
+    fr2 = forecaster.predict(horizon=30)
+    np.testing.assert_allclose(fr1.trend_component.values, fr2.trend_component.values)
+
+
+def test_slope_at_t1_per_day_linear():
+    """_slope_at_t1_per_day for linear model should equal beta/(n-1)."""
+    from seqd._forecast import _slope_at_t1_per_day
+    from seqd._structures import SegmentTrend
+
+    seg = SegmentTrend(
+        segment_index=1,
+        start_date=pd.Timestamp("2022-01-01"),
+        end_date=pd.Timestamp("2022-04-10"),
+        n_obs=100,
+        model_type="linear",
+        alpha=100.0,
+        beta=10.0,
+        gamma=None,
+        T_days=99,
+        aic=0.0,
+        aic_linear=0.0,
+        rss=0.0,
+        selected_reason="only candidate",
+        t_anchor_date=pd.Timestamp("2022-01-01"),
+    )
+    expected = 10.0 / 99.0
+    assert abs(_slope_at_t1_per_day(seg) - expected) < 1e-12
+
+
+def test_slope_at_t1_per_day_quadratic():
+    """_slope_at_t1_per_day for quadratic model should equal (beta+2*gamma)/(n-1)."""
+    from seqd._forecast import _slope_at_t1_per_day
+    from seqd._structures import SegmentTrend
+
+    seg = SegmentTrend(
+        segment_index=1,
+        start_date=pd.Timestamp("2022-01-01"),
+        end_date=pd.Timestamp("2022-04-10"),
+        n_obs=100,
+        model_type="quadratic",
+        alpha=100.0,
+        beta=8.0,
+        gamma=3.0,
+        T_days=99,
+        aic=0.0,
+        aic_linear=0.0,
+        rss=0.0,
+        selected_reason="only candidate",
+        t_anchor_date=pd.Timestamp("2022-01-01"),
+    )
+    # df/dt at t=1 = beta + 2*gamma = 8 + 6 = 14; per day = 14/99
+    expected = 14.0 / 99.0
+    assert abs(_slope_at_t1_per_day(seg) - expected) < 1e-12
+
+
+def test_slope_at_t1_per_day_constant():
+    """_slope_at_t1_per_day for constant model should be 0."""
+    from seqd._forecast import _slope_at_t1_per_day
+    from seqd._structures import SegmentTrend
+
+    seg = SegmentTrend(
+        segment_index=1,
+        start_date=pd.Timestamp("2022-01-01"),
+        end_date=pd.Timestamp("2022-04-10"),
+        n_obs=100,
+        model_type="constant",
+        alpha=100.0,
+        beta=0.0,
+        gamma=None,
+        T_days=99,
+        aic=0.0,
+        aic_linear=0.0,
+        rss=0.0,
+        selected_reason="only candidate",
+        t_anchor_date=pd.Timestamp("2022-01-01"),
+    )
+    assert _slope_at_t1_per_day(seg) == 0.0

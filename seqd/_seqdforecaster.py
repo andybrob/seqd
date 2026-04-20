@@ -30,27 +30,52 @@ class SeqdForecaster:
     ----------
     result : DecompositionResult
         Output of ``SeqdDecomposer.fit()``.  Must have a non-empty residual.
+    slope_blend_alpha : float
+        Weight placed on the penultimate segment's slope when blending for
+        trend extrapolation (H1 fix).  Value must be in ``[0.0, 1.0]``.
+
+        ``blended_slope = alpha * slope_penultimate + (1 - alpha) * slope_final``
+
+        At ``alpha=0.0`` (default) no blending occurs and the final segment's
+        own slope drives extrapolation (legacy behaviour).  At ``alpha=1.0``
+        the penultimate slope is used entirely.  Recommended value: ``0.3``
+        to suppress Q4-contaminated final segment slopes while retaining
+        most of the recent trend signal.
+
+        When only one segment exists, blending is skipped regardless of
+        ``alpha``.
 
     Raises
     ------
     ValueError
         If ``result.residual`` is empty or has fewer than 2 observations.
+    ValueError
+        If ``slope_blend_alpha`` is not in ``[0.0, 1.0]``.
 
     Examples
     --------
-    >>> forecaster = SeqdForecaster(result)
+    >>> forecaster = SeqdForecaster(result, slope_blend_alpha=0.3)
     >>> forecaster.fit(changepoint_penalty_beta=3.0, min_segment_size=90)
     >>> fr = forecaster.predict(horizon=365)
     >>> fr.forecast.head()
     """
 
-    def __init__(self, result: DecompositionResult) -> None:
+    def __init__(
+        self,
+        result: DecompositionResult,
+        slope_blend_alpha: float = 0.0,
+    ) -> None:
         if len(result.residual) < 2:
             raise ValueError(
                 f"result.residual must have at least 2 observations "
                 f"(got {len(result.residual)})."
             )
+        if not (0.0 <= slope_blend_alpha <= 1.0):
+            raise ValueError(
+                f"slope_blend_alpha must be in [0.0, 1.0] (got {slope_blend_alpha})."
+            )
         self._result = result
+        self._slope_blend_alpha = slope_blend_alpha
         self._fitted = False
         self._changepoints: Optional[List[pd.Timestamp]] = None
         self._segments: Optional[List[SegmentTrend]] = None
@@ -208,10 +233,13 @@ class SeqdForecaster:
 
         # --- Trend projection ---
         last_segment = segments[-1]
+        penultimate_segment = segments[-2] if len(segments) >= 2 else None
         trend_arr, forecast_warnings = _project_trend(
             last_segment=last_segment,
             horizon=horizon,
             max_extrapolation_days=max_extrapolation_days,
+            penultimate_segment=penultimate_segment,
+            slope_blend_alpha=self._slope_blend_alpha,
         )
 
         # --- Weekly projection ---
@@ -314,12 +342,13 @@ def forecast_from_result(
     min_segment_size: int = 90,
     aic_linear_delta: float = 2.0,
     max_extrapolation_days: int = 365,
+    slope_blend_alpha: float = 0.0,
 ) -> ForecastResult:
     """Convenience wrapper: fit and forecast in one call.
 
     Equivalent to::
 
-        SeqdForecaster(result).fit(
+        SeqdForecaster(result, slope_blend_alpha=slope_blend_alpha).fit(
             changepoint_penalty_beta=changepoint_penalty_beta,
             min_segment_size=min_segment_size,
             aic_linear_delta=aic_linear_delta,
@@ -345,13 +374,15 @@ def forecast_from_result(
         See :meth:`SeqdForecaster.fit`.
     max_extrapolation_days : int
         See :meth:`SeqdForecaster.predict`.
+    slope_blend_alpha : float
+        See :class:`SeqdForecaster`.  Default 0.0 (no blending).
 
     Returns
     -------
     ForecastResult
     """
     return (
-        SeqdForecaster(result)
+        SeqdForecaster(result, slope_blend_alpha=slope_blend_alpha)
         .fit(
             changepoint_penalty_beta=changepoint_penalty_beta,
             min_segment_size=min_segment_size,
