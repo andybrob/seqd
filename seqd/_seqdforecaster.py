@@ -70,6 +70,21 @@ class SeqdForecaster:
         the underlying business growth rate is moderate: holiday-season lift
         is economically a multiplier on the baseline level, not an independent
         quantity.
+    use_adaptive_ipm : bool
+        Convenience preset that enables recency-weighted IPM projection with
+        trend-blending.  When ``True``, overrides the following parameters
+        regardless of the values passed for them:
+
+        - ``trend_yoy_blend = 0.5``  (equal blend of OLS and trend-implied IPM)
+        - ``ipm_decay_halflife = 1.5``  (recent years weighted more heavily)
+
+        Default ``False``.  Use this when recent business momentum should
+        inform holiday projection — for example, when the growth rate has
+        shifted meaningfully in the past 1–2 years and you want the IPM
+        projection to reflect that recency.
+
+        ``slope_blend_alpha`` and ``ipm_max_years`` are **not** overridden by
+        this preset and retain their passed (or default) values.
 
     Raises
     ------
@@ -84,7 +99,17 @@ class SeqdForecaster:
     >>> forecaster.fit(changepoint_penalty_beta=3.0, min_segment_size=60)
     >>> fr = forecaster.predict(horizon=365)
     >>> fr.forecast.head()
+
+    Using the adaptive IPM preset:
+
+    >>> forecaster = SeqdForecaster(result, use_adaptive_ipm=True)
+    >>> forecaster.fit(changepoint_penalty_beta=3.0, min_segment_size=60)
+    >>> fr = forecaster.predict(horizon=365)
     """
+
+    # Adaptive IPM preset values
+    _ADAPTIVE_IPM_TREND_YOY_BLEND: float = 0.5
+    _ADAPTIVE_IPM_DECAY_HALFLIFE: float = 1.5
 
     def __init__(
         self,
@@ -93,7 +118,13 @@ class SeqdForecaster:
         trend_yoy_blend: float = 0.0,
         ipm_max_years: int = 4,
         ipm_decay_halflife: float = 0.0,
+        use_adaptive_ipm: bool = False,
     ) -> None:
+        # Apply adaptive IPM preset overrides before validation
+        if use_adaptive_ipm:
+            trend_yoy_blend = self._ADAPTIVE_IPM_TREND_YOY_BLEND
+            ipm_decay_halflife = self._ADAPTIVE_IPM_DECAY_HALFLIFE
+
         if len(result.residual) < 2:
             raise ValueError(
                 f"result.residual must have at least 2 observations "
@@ -120,6 +151,7 @@ class SeqdForecaster:
         self._trend_yoy_blend = trend_yoy_blend
         self._ipm_max_years = ipm_max_years
         self._ipm_decay_halflife = ipm_decay_halflife
+        self._use_adaptive_ipm = use_adaptive_ipm
         self._fitted = False
         self._changepoints: Optional[List[pd.Timestamp]] = None
         self._segments: Optional[List[SegmentTrend]] = None
